@@ -69,8 +69,7 @@ target_compile_definitions(mycsg_fastgltf PRIVATE
     SIMDJSON_TARGET_VERSION="3.12.3"
 )
 
-add_executable(my-cs-go
-    src/main.cpp
+set(MYCSGO_APP_SOURCES
     src/app/Application.cpp
     src/app/Settings.cpp
     src/app/MainMenu.cpp
@@ -87,87 +86,101 @@ add_executable(my-cs-go
     src/util/Log.cpp
 )
 
-target_link_libraries(my-cs-go PRIVATE Jolt mycsg_fastgltf mycsg_imgui enet)
-
-target_include_directories(my-cs-go PRIVATE
-    src
-)
-
-target_include_directories(my-cs-go SYSTEM PRIVATE
-    third_party/enet/include
-    third_party/entt
-    third_party/glm
-    third_party/miniaudio
-    third_party/spdlog/include
-    third_party/stb
-    third_party/tinyobjloader
-    third_party/vma
-)
-
 set(MYCSGO_LOCAL_VULKAN_HEADERS "${CMAKE_SOURCE_DIR}/.local-tools/vendor/Vulkan-Headers-vulkan-sdk-1.4.341.0/include")
 if(EXISTS "${MYCSGO_LOCAL_VULKAN_HEADERS}/vulkan/vulkan.h")
-    target_include_directories(my-cs-go PRIVATE "${MYCSGO_LOCAL_VULKAN_HEADERS}")
-    target_include_directories(mycsg_imgui PRIVATE "${MYCSGO_LOCAL_VULKAN_HEADERS}")
+    set(MYCSGO_VULKAN_INCLUDE_DIR "${MYCSGO_LOCAL_VULKAN_HEADERS}")
 else()
     find_path(MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR)
         message(FATAL_ERROR "Vulkan headers were not found. Install Vulkan SDK or populate .local-tools/vendor/Vulkan-Headers-*/include.")
     endif()
-    target_include_directories(my-cs-go PRIVATE "${MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR}")
-    target_include_directories(mycsg_imgui PRIVATE "${MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR}")
+    set(MYCSGO_VULKAN_INCLUDE_DIR "${MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR}")
 endif()
 
+target_include_directories(mycsg_imgui PRIVATE "${MYCSGO_VULKAN_INCLUDE_DIR}")
+
 if(WIN32)
-    target_sources(my-cs-go PRIVATE src/platform/win32/Win32Window.cpp)
-    target_compile_definitions(my-cs-go PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE VK_USE_PLATFORM_WIN32_KHR)
     set(MYCSGO_SDL3_ROOT "${CMAKE_SOURCE_DIR}/third_party/SDL3/x86_64-w64-mingw32")
     if(EXISTS "${MYCSGO_SDL3_ROOT}/include/SDL3/SDL.h" AND EXISTS "${MYCSGO_SDL3_ROOT}/lib/libSDL3.dll.a")
-        target_include_directories(my-cs-go SYSTEM PRIVATE "${MYCSGO_SDL3_ROOT}/include")
         target_include_directories(mycsg_imgui SYSTEM PRIVATE "${MYCSGO_SDL3_ROOT}/include")
-        target_link_libraries(my-cs-go PRIVATE "${MYCSGO_SDL3_ROOT}/lib/libSDL3.dll.a")
-
-        if(EXISTS "${MYCSGO_SDL3_ROOT}/bin/SDL3.dll")
-            add_custom_command(TARGET my-cs-go POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                    "${MYCSGO_SDL3_ROOT}/bin/SDL3.dll"
-                    "$<TARGET_FILE_DIR:my-cs-go>/SDL3.dll"
-                VERBATIM
-            )
-        endif()
     else()
         message(FATAL_ERROR "SDL3 MinGW package was not found under third_party/SDL3/x86_64-w64-mingw32.")
     endif()
 
-    target_link_libraries(my-cs-go PRIVATE user32 gdi32 ws2_32 winmm ole32 avrt)
-
     set(MYCSGO_LLVM_MINGW_RUNTIME_DIR "${CMAKE_SOURCE_DIR}/.local-tools/toolchains/llvm-mingw-20260311-ucrt-ubuntu-22.04-x86_64/x86_64-w64-mingw32/bin")
-    if(EXISTS "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}")
-        foreach(MYCSGO_RUNTIME_DLL IN ITEMS libc++.dll libunwind.dll libwinpthread-1.dll)
-            if(EXISTS "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}/${MYCSGO_RUNTIME_DLL}")
-                add_custom_command(TARGET my-cs-go POST_BUILD
-                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}/${MYCSGO_RUNTIME_DLL}"
-                        "$<TARGET_FILE_DIR:my-cs-go>/${MYCSGO_RUNTIME_DLL}"
-                    VERBATIM
-                )
-            endif()
-        endforeach()
+endif()
+
+function(mycsg_configure_target target entry_source)
+    add_executable(${target}
+        ${entry_source}
+        ${MYCSGO_APP_SOURCES}
+    )
+
+    target_link_libraries(${target} PRIVATE Jolt mycsg_fastgltf mycsg_imgui enet)
+
+    target_include_directories(${target} PRIVATE
+        src
+        "${MYCSGO_VULKAN_INCLUDE_DIR}"
+    )
+
+    target_include_directories(${target} SYSTEM PRIVATE
+        third_party/enet/include
+        third_party/entt
+        third_party/glm
+        third_party/miniaudio
+        third_party/spdlog/include
+        third_party/stb
+        third_party/tinyobjloader
+        third_party/vma
+    )
+
+    if(WIN32)
+        target_sources(${target} PRIVATE src/platform/win32/Win32Window.cpp)
+        target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE VK_USE_PLATFORM_WIN32_KHR)
+        target_include_directories(${target} SYSTEM PRIVATE "${MYCSGO_SDL3_ROOT}/include")
+        target_link_libraries(${target} PRIVATE "${MYCSGO_SDL3_ROOT}/lib/libSDL3.dll.a")
+        target_link_libraries(${target} PRIVATE user32 gdi32 ws2_32 winmm ole32 avrt)
+
+        if(EXISTS "${MYCSGO_SDL3_ROOT}/bin/SDL3.dll")
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${MYCSGO_SDL3_ROOT}/bin/SDL3.dll"
+                    "$<TARGET_FILE_DIR:${target}>/SDL3.dll"
+                VERBATIM
+            )
+        endif()
+
+        if(EXISTS "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}")
+            foreach(MYCSGO_RUNTIME_DLL IN ITEMS libc++.dll libunwind.dll libwinpthread-1.dll)
+                if(EXISTS "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}/${MYCSGO_RUNTIME_DLL}")
+                    add_custom_command(TARGET ${target} POST_BUILD
+                        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                            "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}/${MYCSGO_RUNTIME_DLL}"
+                            "$<TARGET_FILE_DIR:${target}>/${MYCSGO_RUNTIME_DLL}"
+                        VERBATIM
+                    )
+                endif()
+            endforeach()
+        endif()
+    else()
+        target_sources(${target} PRIVATE src/platform/null/NullWindow.cpp)
+        target_link_libraries(${target} PRIVATE dl)
     endif()
-else()
-    target_sources(my-cs-go PRIVATE src/platform/null/NullWindow.cpp)
-    target_link_libraries(my-cs-go PRIVATE dl)
-endif()
 
-target_compile_definitions(my-cs-go PRIVATE
-    MYCSGO_PROJECT_NAME="my-cs-go"
-    MYCSGO_ASSET_ROOT="${CMAKE_SOURCE_DIR}/assets"
-    VK_NO_PROTOTYPES
-)
+    target_compile_definitions(${target} PRIVATE
+        MYCSGO_PROJECT_NAME="${target}"
+        MYCSGO_ASSET_ROOT="${CMAKE_SOURCE_DIR}/assets"
+        VK_NO_PROTOTYPES
+    )
 
-if(MSVC)
-    target_compile_options(my-cs-go PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(my-cs-go PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 
-set_property(TARGET my-cs-go PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TARGET ${target} PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endfunction()
+
+mycsg_configure_target(my-cs-go src/main.cpp)
+mycsg_configure_target(my-cs-go-editor src/editor_main.cpp)

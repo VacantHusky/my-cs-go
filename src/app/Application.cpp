@@ -4,6 +4,7 @@
 #include "renderer/Renderer.h"
 #include "util/FileSystem.h"
 #include "util/Log.h"
+#include "util/MapEditorCameraMath.h"
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #define GLM_FORCE_RIGHT_HANDED
@@ -32,11 +33,6 @@ constexpr float kPi = 3.1415926535f;
 constexpr float kSinglePlayerEyeHeight = 1.0f;
 constexpr float kMapEditorDefaultPlacementDistance = 7.5f;
 constexpr float kMapEditorMaxPlacementDistance = 128.0f;
-constexpr float kMapEditorPerspectiveFovRadians = 1.08f;
-constexpr float kMapEditorPerspectiveNearPlane = 0.05f;
-constexpr float kMapEditorPerspectiveFarPlane = 192.0f;
-constexpr float kMapEditorOrthoNearPlane = 0.05f;
-constexpr float kMapEditorOrthoFarPlane = 256.0f;
 constexpr std::size_t kMapEditorUndoLimit = 96;
 
 struct RaySurfaceHit {
@@ -52,20 +48,6 @@ float dotVec3(const util::Vec3& lhs, const util::Vec3& rhs);
 float lengthSquaredVec3(const util::Vec3& value);
 float lengthVec3(const util::Vec3& value);
 util::Vec3 normalizeVec3(const util::Vec3& value);
-util::Vec3 cameraForwardVector(float yawRadians, float pitchRadians);
-glm::mat4 buildMapEditorProjectionMatrix(MapEditorViewMode viewMode,
-                                         float width,
-                                         float height,
-                                         float orthoSpan);
-glm::mat4 buildMapEditorViewMatrix(const gameplay::MapData& map,
-                                   MapEditorViewMode viewMode,
-                                   const util::Vec3& cameraPosition,
-                                   float yawRadians,
-                                   float pitchRadians,
-                                   float orthoSpan);
-util::Vec3 mapEditorOrthoEyePosition(const gameplay::MapData& map,
-                                     const util::Vec3& cameraPosition,
-                                     float orthoSpan);
 
 std::filesystem::path assetRootPath() {
 #ifdef _WIN32
@@ -815,76 +797,6 @@ util::Vec3 normalizeVec3(const util::Vec3& value) {
     return multiplyVec3(value, 1.0f / length);
 }
 
-util::Vec3 cameraForwardVector(const float yawRadians, const float pitchRadians) {
-    const float cosPitch = std::cos(pitchRadians);
-    return normalizeVec3({
-        std::cos(yawRadians) * cosPitch,
-        std::sin(pitchRadians),
-        std::sin(yawRadians) * cosPitch,
-    });
-}
-
-util::Vec3 mapEditorOrthoEyePosition(const gameplay::MapData& map,
-                                     const util::Vec3& cameraPosition,
-                                     const float orthoSpan) {
-    return {
-        cameraPosition.x,
-        std::max(
-            static_cast<float>(std::max(map.height, 8)) + 12.0f,
-            orthoSpan * 2.2f),
-        cameraPosition.z,
-    };
-}
-
-glm::mat4 buildMapEditorProjectionMatrix(const MapEditorViewMode viewMode,
-                                         const float width,
-                                         const float height,
-                                         const float orthoSpan) {
-    const float safeHeight = std::max(1.0f, height);
-    const float aspect = width / safeHeight;
-    glm::mat4 projection(1.0f);
-    if (viewMode == MapEditorViewMode::OrthoTop) {
-        const float span = std::max(4.0f, orthoSpan);
-        projection = glm::orthoRH_ZO(
-            -span * aspect,
-            span * aspect,
-            -span,
-            span,
-            kMapEditorOrthoNearPlane,
-            kMapEditorOrthoFarPlane);
-    } else {
-        projection = glm::perspectiveRH_ZO(
-            kMapEditorPerspectiveFovRadians,
-            width / safeHeight,
-            kMapEditorPerspectiveNearPlane,
-            kMapEditorPerspectiveFarPlane);
-    }
-    projection[1][1] *= -1.0f;
-    return projection;
-}
-
-glm::mat4 buildMapEditorViewMatrix(const gameplay::MapData& map,
-                                   const MapEditorViewMode viewMode,
-                                   const util::Vec3& cameraPosition,
-                                   const float yawRadians,
-                                   const float pitchRadians,
-                                   const float orthoSpan) {
-    if (viewMode == MapEditorViewMode::OrthoTop) {
-        const util::Vec3 eye = mapEditorOrthoEyePosition(map, cameraPosition, orthoSpan);
-        return glm::lookAtRH(
-            glm::vec3(eye.x, eye.y, eye.z),
-            glm::vec3(cameraPosition.x, 0.0f, cameraPosition.z),
-            glm::vec3(0.0f, 0.0f, -1.0f));
-    }
-
-    const util::Vec3 forward = cameraForwardVector(yawRadians, pitchRadians);
-    const util::Vec3 target = addVec3(cameraPosition, forward);
-    return glm::lookAtRH(
-        glm::vec3(cameraPosition.x, cameraPosition.y, cameraPosition.z),
-        glm::vec3(target.x, target.y, target.z),
-        glm::vec3(0.0f, 1.0f, 0.0f));
-}
-
 renderer::RenderFrame::EquipmentSlot renderEquipmentSlot(const TrainingEquipmentSlot slot) {
     switch (slot) {
         case TrainingEquipmentSlot::Primary:
@@ -899,7 +811,9 @@ renderer::RenderFrame::EquipmentSlot renderEquipmentSlot(const TrainingEquipment
 
 }  // namespace
 
-Application::Application() = default;
+Application::Application(const ApplicationLaunchMode launchMode)
+    : launchMode_(launchMode) {}
+
 Application::~Application() = default;
 
 int Application::run() {
@@ -951,8 +865,12 @@ bool Application::initialize() {
     });
 
     spdlog::info("[Init] 正在创建窗口...");
+    std::string initialWindowTitle = mainMenu_.title();
+    if (launchMode_ == ApplicationLaunchMode::Editor) {
+        initialWindowTitle += " | 地图编辑器";
+    }
     window_ = platform::createWindow();
-    if (!window_ || !window_->create({settings_.video.width, settings_.video.height, mainMenu_.title()})) {
+    if (!window_ || !window_->create({settings_.video.width, settings_.video.height, initialWindowTitle})) {
         spdlog::error("Failed to create game window.");
         return false;
     }
@@ -976,10 +894,28 @@ bool Application::initialize() {
 
     spdlog::info("Loaded {} weapons and {} material profiles.",
         contentDatabase_.weapons().size(), contentDatabase_.materials().size());
-    initializeSinglePlayerView();
+    initializeLaunchFlow();
     refreshWindowTitle();
     logCurrentFlow();
     return true;
+}
+
+void Application::initializeLaunchFlow() {
+    if (launchMode_ == ApplicationLaunchMode::Editor) {
+        mapBrowserTargetFlow_ = AppFlow::MapEditor;
+        refreshMapCatalog();
+        if (!mapCatalogPaths_.empty()) {
+            loadEditorMapByIndex(activeMapCatalogIndex_);
+        } else {
+            createNewEditorMap();
+        }
+        currentFlow_ = AppFlow::MapEditor;
+        mapEditorStatus_ = std::string("正在编辑地图: ") + activeMapPath_.stem().string();
+        syncInputMode();
+        return;
+    }
+
+    initializeSinglePlayerView();
 }
 
 void Application::tick(const float deltaSeconds) {
@@ -1176,7 +1112,7 @@ void Application::tick(const float deltaSeconds) {
         .editorStatusLabel = mapEditorStatus_,
         .editorMapFileLabel = activeMapPath_.stem().string(),
         .editorMouseLookActive = mapEditorMouseLookActive_,
-        .editorIsOrthoView = mapEditorViewMode_ == MapEditorViewMode::OrthoTop,
+        .editorIsOrthoView = mapEditorViewMode_ == MapEditorViewMode::Ortho25D,
         .editorOrthoSpan = mapEditorOrthoSpan_,
         .editorUndoAvailable = !mapEditorUndoStack_.empty(),
         .editorMapIndex = activeMapCatalogIndex_,
@@ -1283,7 +1219,7 @@ void Application::handleInput() {
         lastInput_.editorSavePressed || lastInput_.editorDeletePressed || lastInput_.editorPreviousMapPressed ||
         lastInput_.editorNextMapPressed || lastInput_.editorNewMapPressed || lastInput_.editorUndoPressed ||
         lastInput_.editorToggleProjectionPressed || lastInput_.primaryClickPressed ||
-        lastInput_.mouseDeltaX != 0 || lastInput_.mouseDeltaY != 0;
+        lastInput_.mouseDeltaX != 0 || lastInput_.mouseDeltaY != 0 || lastInput_.mouseWheelDelta != 0;
     if (renderer_ != nullptr) {
         if (renderer_->wantsKeyboardCapture()) {
             lastInput_.upPressed = false;
@@ -1324,6 +1260,7 @@ void Application::handleInput() {
             lastInput_.secondaryClickHeld = false;
             lastInput_.mouseDeltaX = 0;
             lastInput_.mouseDeltaY = 0;
+            lastInput_.mouseWheelDelta = 0;
         }
     }
     const platform::InputSnapshot& input = lastInput_;
@@ -1569,6 +1506,23 @@ void Application::returnToMainMenu(const std::string_view statusOverride) {
             ? "尚未启动房间"
             : std::string(statusOverride);
     }
+
+    if (launchMode_ == ApplicationLaunchMode::Editor) {
+        if (currentFlow_ == AppFlow::MapBrowser) {
+            if (window_ != nullptr) {
+                window_->requestClose();
+            }
+            return;
+        }
+
+        openMapBrowser(AppFlow::MapEditor);
+        mapEditorStatus_ = statusOverride.empty()
+            ? "已返回地图列表"
+            : std::string(statusOverride);
+        needsRedraw_ = true;
+        return;
+    }
+
     currentFlow_ = AppFlow::MainMenu;
     syncInputMode();
     refreshWindowTitle();
@@ -1752,14 +1706,10 @@ void Application::handleRendererUiActions() {
                 break;
             case renderer::UiActionType::ToggleMapEditorProjection:
                 if (currentFlow_ == AppFlow::MapEditor) {
-                    mapEditorViewMode_ = mapEditorViewMode_ == MapEditorViewMode::Perspective
-                        ? MapEditorViewMode::OrthoTop
-                        : MapEditorViewMode::Perspective;
-                    mapEditorMouseLookActive_ = false;
-                    syncInputMode();
-                    syncMapEditorTargetFromView();
-                    mapEditorStatus_ = std::string("视图已切换为: ") + mapEditorViewModeLabel();
-                    needsRedraw_ = true;
+                    switchMapEditorViewMode(
+                        mapEditorViewMode_ == MapEditorViewMode::Perspective
+                            ? MapEditorViewMode::Ortho25D
+                            : MapEditorViewMode::Perspective);
                 }
                 break;
             case renderer::UiActionType::UndoMapEditorChange:
@@ -1975,6 +1925,83 @@ void Application::initializeSinglePlayerView() {
         singlePlayerCameraPosition_.z);
 }
 
+util::Vec3 Application::clampMapEditorPerspectiveCameraPosition(const util::Vec3& position) const {
+    return {
+        std::clamp(position.x, -8.0f, static_cast<float>(activeMap_.width) + 8.0f),
+        std::clamp(position.y, 0.8f, static_cast<float>(std::max(activeMap_.height, 8)) + 20.0f),
+        std::clamp(position.z, -8.0f, static_cast<float>(activeMap_.depth) + 8.0f),
+    };
+}
+
+util::Vec3 Application::clampMapEditorOrthoFocusPosition(const util::Vec3& position) const {
+    return clampEditorTargetPosition(activeMap_, position);
+}
+
+util::Vec3 Application::deriveMapEditorFocusPointFromPerspective() const {
+    if (mapEditorHasTarget_) {
+        return clampMapEditorOrthoFocusPosition(mapEditorTargetPosition_);
+    }
+
+    const util::Vec3 forward = util::cameraForwardVector(
+        mapEditorPerspectiveCameraYawRadians_,
+        mapEditorPerspectiveCameraPitchRadians_);
+    RaySurfaceHit groundHit{};
+    if (rayIntersectGroundPlane(
+            activeMap_,
+            mapEditorPerspectiveCameraPosition_,
+            forward,
+            kMapEditorMaxPlacementDistance,
+            groundHit)) {
+        return clampMapEditorOrthoFocusPosition(groundHit.point);
+    }
+
+    return clampMapEditorOrthoFocusPosition(
+        defaultFloatingEditorTargetPosition(activeMap_, mapEditorPerspectiveCameraPosition_, forward));
+}
+
+void Application::syncMapEditorCameraState() {
+    if (mapEditorViewMode_ == MapEditorViewMode::Perspective) {
+        mapEditorPerspectiveCameraPosition_ = clampMapEditorPerspectiveCameraPosition(mapEditorPerspectiveCameraPosition_);
+        mapEditorCameraPosition_ = mapEditorPerspectiveCameraPosition_;
+        mapEditorCameraYawRadians_ = mapEditorPerspectiveCameraYawRadians_;
+        mapEditorCameraPitchRadians_ = mapEditorPerspectiveCameraPitchRadians_;
+        return;
+    }
+
+    mapEditorOrthoFocusPosition_ = clampMapEditorOrthoFocusPosition(mapEditorOrthoFocusPosition_);
+    mapEditorCameraPosition_ = mapEditorOrthoFocusPosition_;
+    mapEditorCameraYawRadians_ = util::mapEditorOrthoYawRadians();
+    mapEditorCameraPitchRadians_ = util::mapEditorOrthoPitchRadians();
+}
+
+void Application::switchMapEditorViewMode(const MapEditorViewMode nextMode) {
+    if (mapEditorViewMode_ == nextMode) {
+        syncMapEditorCameraState();
+        syncMapEditorTargetFromView();
+        return;
+    }
+
+    if (nextMode == MapEditorViewMode::Ortho25D) {
+        const util::Vec3 focus = deriveMapEditorFocusPointFromPerspective();
+        mapEditorOrthoFocusPosition_ = focus;
+        mapEditorPerspectiveFocusOffset_ = subtractVec3(mapEditorPerspectiveCameraPosition_, focus);
+    } else {
+        const util::Vec3 focus = clampMapEditorOrthoFocusPosition(mapEditorOrthoFocusPosition_);
+        util::Vec3 nextPosition = addVec3(focus, mapEditorPerspectiveFocusOffset_);
+        const float floorHeight = gameplay::sampleFloorHeight(activeMap_, nextPosition.x, nextPosition.z);
+        nextPosition.y = std::max(nextPosition.y, floorHeight + 1.6f);
+        mapEditorPerspectiveCameraPosition_ = clampMapEditorPerspectiveCameraPosition(nextPosition);
+    }
+
+    mapEditorViewMode_ = nextMode;
+    mapEditorMouseLookActive_ = false;
+    syncInputMode();
+    syncMapEditorCameraState();
+    syncMapEditorTargetFromView();
+    mapEditorStatus_ = std::string("视图已切换为: ") + mapEditorViewModeLabel();
+    needsRedraw_ = true;
+}
+
 void Application::initializeMapEditorView() {
     util::Vec3 focus = centerOfCell(std::max(0, activeMap_.width / 2), std::max(0, activeMap_.depth / 2), 0.0f);
     for (const auto& spawn : activeMap_.spawns) {
@@ -1984,18 +2011,21 @@ void Application::initializeMapEditorView() {
         }
     }
 
+    focus = clampMapEditorOrthoFocusPosition(focus);
     const float focusFloor = gameplay::sampleFloorHeight(activeMap_, focus.x, focus.z);
-    mapEditorCameraPosition_ = {
-        std::clamp(focus.x - 5.0f, -6.0f, static_cast<float>(activeMap_.width) + 6.0f),
+    mapEditorPerspectiveCameraPosition_ = clampMapEditorPerspectiveCameraPosition({
+        focus.x - 5.0f,
         std::max(3.0f, focusFloor + 3.4f),
-        std::clamp(focus.z - 5.0f, -6.0f, static_cast<float>(activeMap_.depth) + 6.0f),
-    };
-    mapEditorCameraYawRadians_ = degreesToRadians(38.0f);
-    mapEditorCameraPitchRadians_ = degreesToRadians(-20.0f);
+        focus.z - 5.0f,
+    });
+    mapEditorPerspectiveCameraYawRadians_ = degreesToRadians(38.0f);
+    mapEditorPerspectiveCameraPitchRadians_ = degreesToRadians(-20.0f);
+    mapEditorPerspectiveFocusOffset_ = subtractVec3(mapEditorPerspectiveCameraPosition_, focus);
+    mapEditorOrthoFocusPosition_ = focus;
     mapEditorOrthoSpan_ = std::max(
         8.0f,
         static_cast<float>(std::max(activeMap_.width, activeMap_.depth)) * 0.55f);
-    mapEditorTargetPosition_ = clampEditorTargetPosition(activeMap_, focus);
+    mapEditorTargetPosition_ = focus;
     mapEditorTargetNormal_ = {0.0f, 1.0f, 0.0f};
     mapEditorHasTarget_ = true;
     mapEditorTargetOnSurface_ = true;
@@ -2003,9 +2033,7 @@ void Application::initializeMapEditorView() {
     hoveredEditorPropIndex_.reset();
     hoveredEditorSpawnIndex_.reset();
     selectedEditorPropIndex_.reset();
-    if (mapEditorViewMode_ == MapEditorViewMode::OrthoTop) {
-        mapEditorCameraPosition_.y = mapEditorOrthoSpan_;
-    }
+    syncMapEditorCameraState();
     syncInputMode();
     syncMapEditorTargetFromView();
     spdlog::info("[MapEditor] 3D editor camera ready at ({}, {}, {}).",
@@ -2031,14 +2059,16 @@ void Application::updateMapEditorView(const platform::InputSnapshot& input, cons
         const float mouseYawScale = 0.0024f * mouseSensitivity;
         const float mousePitchScale = 0.0024f * mouseSensitivity * mouseVerticalSensitivity;
         if (mapEditorMouseLookActive_) {
-            mapEditorCameraYawRadians_ += static_cast<float>(input.mouseDeltaX) * mouseYawScale;
-            mapEditorCameraPitchRadians_ = std::clamp(
-                mapEditorCameraPitchRadians_ - static_cast<float>(input.mouseDeltaY) * mousePitchScale,
+            mapEditorPerspectiveCameraYawRadians_ += static_cast<float>(input.mouseDeltaX) * mouseYawScale;
+            mapEditorPerspectiveCameraPitchRadians_ = std::clamp(
+                mapEditorPerspectiveCameraPitchRadians_ + static_cast<float>(input.mouseDeltaY) * mousePitchScale,
                 -maxPitchRadians,
                 maxPitchRadians);
         }
 
-        const util::Vec3 forward = cameraForwardVector(mapEditorCameraYawRadians_, mapEditorCameraPitchRadians_);
+        const util::Vec3 forward = util::cameraForwardVector(
+            mapEditorPerspectiveCameraYawRadians_,
+            mapEditorPerspectiveCameraPitchRadians_);
         const util::Vec3 forwardFlat = normalizeVec3({forward.x, 0.0f, forward.z});
         const util::Vec3 right = normalizeVec3({-forwardFlat.z, 0.0f, forwardFlat.x});
 
@@ -2064,16 +2094,12 @@ void Application::updateMapEditorView(const platform::InputSnapshot& input, cons
 
         const float speed = 8.5f;
         if (lengthSquaredVec3(velocity) > 0.0001f) {
-            const util::Vec3 normalizedVelocity = normalizeVec3(velocity);
-            mapEditorCameraPosition_ = addVec3(
-                mapEditorCameraPosition_,
-                multiplyVec3(normalizedVelocity, speed * deltaSeconds));
+            mapEditorPerspectiveCameraPosition_ = clampMapEditorPerspectiveCameraPosition(
+                addVec3(
+                    mapEditorPerspectiveCameraPosition_,
+                    multiplyVec3(normalizeVec3(velocity), speed * deltaSeconds)));
             needsRedraw_ = true;
         }
-
-        mapEditorCameraPosition_.x = std::clamp(mapEditorCameraPosition_.x, -8.0f, static_cast<float>(activeMap_.width) + 8.0f);
-        mapEditorCameraPosition_.y = std::clamp(mapEditorCameraPosition_.y, 0.8f, static_cast<float>(std::max(activeMap_.height, 8)) + 20.0f);
-        mapEditorCameraPosition_.z = std::clamp(mapEditorCameraPosition_.z, -8.0f, static_cast<float>(activeMap_.depth) + 8.0f);
     } else {
         if (mapEditorMouseLookActive_) {
             mapEditorMouseLookActive_ = false;
@@ -2081,25 +2107,32 @@ void Application::updateMapEditorView(const platform::InputSnapshot& input, cons
             needsRedraw_ = true;
         }
 
+        const util::Vec3 orthoForward = util::cameraForwardVector(
+            util::mapEditorOrthoYawRadians(),
+            util::mapEditorOrthoPitchRadians());
+        const util::Vec3 orthoForwardFlat = normalizeVec3({orthoForward.x, 0.0f, orthoForward.z});
+        const util::Vec3 orthoRight = normalizeVec3({-orthoForwardFlat.z, 0.0f, orthoForwardFlat.x});
+
         util::Vec3 pan{};
         if (input.moveForwardHeld) {
-            pan.z -= 1.0f;
+            pan = addVec3(pan, orthoForwardFlat);
         }
         if (input.moveBackwardHeld) {
-            pan.z += 1.0f;
+            pan = subtractVec3(pan, orthoForwardFlat);
         }
         if (input.strafeLeftHeld) {
-            pan.x -= 1.0f;
+            pan = subtractVec3(pan, orthoRight);
         }
         if (input.strafeRightHeld) {
-            pan.x += 1.0f;
+            pan = addVec3(pan, orthoRight);
         }
 
         const float panSpeed = std::max(6.0f, mapEditorOrthoSpan_ * 0.9f);
         if (lengthSquaredVec3(pan) > 0.0001f) {
-            mapEditorCameraPosition_ = addVec3(
-                mapEditorCameraPosition_,
-                multiplyVec3(normalizeVec3(pan), panSpeed * deltaSeconds));
+            mapEditorOrthoFocusPosition_ = clampMapEditorOrthoFocusPosition(
+                addVec3(
+                    mapEditorOrthoFocusPosition_,
+                    multiplyVec3(normalizeVec3(pan), panSpeed * deltaSeconds)));
             needsRedraw_ = true;
         }
 
@@ -2116,11 +2149,18 @@ void Application::updateMapEditorView(const platform::InputSnapshot& input, cons
             needsRedraw_ = true;
         }
 
-        mapEditorCameraPosition_.x = std::clamp(mapEditorCameraPosition_.x, -8.0f, static_cast<float>(activeMap_.width) + 8.0f);
-        mapEditorCameraPosition_.z = std::clamp(mapEditorCameraPosition_.z, -8.0f, static_cast<float>(activeMap_.depth) + 8.0f);
-        mapEditorCameraPosition_.y = mapEditorOrthoSpan_;
+        if (input.mouseWheelDelta != 0) {
+            const float zoomScale = std::max(0.6f, mapEditorOrthoSpan_ * 0.12f);
+            const float wheelZoom = static_cast<float>(input.mouseWheelDelta) * zoomScale;
+            const float zoomedSpan = std::clamp(mapEditorOrthoSpan_ - wheelZoom, 4.0f, 96.0f);
+            if (std::abs(zoomedSpan - mapEditorOrthoSpan_) > 0.001f) {
+                mapEditorOrthoSpan_ = zoomedSpan;
+                needsRedraw_ = true;
+            }
+        }
     }
 
+    syncMapEditorCameraState();
     syncMapEditorTargetFromView();
 }
 
@@ -2732,14 +2772,10 @@ void Application::handleMapEditorInput(const platform::InputSnapshot& input) {
     }
 
     if (input.editorToggleProjectionPressed) {
-        mapEditorViewMode_ = mapEditorViewMode_ == MapEditorViewMode::Perspective
-            ? MapEditorViewMode::OrthoTop
-            : MapEditorViewMode::Perspective;
-        mapEditorMouseLookActive_ = false;
-        syncInputMode();
-        syncMapEditorTargetFromView();
-        mapEditorStatus_ = std::string("视图已切换为: ") + mapEditorViewModeLabel();
-        needsRedraw_ = true;
+        switchMapEditorViewMode(
+            mapEditorViewMode_ == MapEditorViewMode::Perspective
+                ? MapEditorViewMode::Ortho25D
+                : MapEditorViewMode::Perspective);
     }
 
     if (input.selectPrimaryPressed) {
@@ -2874,7 +2910,7 @@ std::optional<std::size_t> Application::pickMapEditorSpawnFromView(float* outDis
 
 bool Application::pickMapEditorCellFromView(int& cellX, int& cellZ, float* outDistance) const {
     const util::Vec3 origin = mapEditorCameraPosition_;
-    const util::Vec3 direction = cameraForwardVector(mapEditorCameraYawRadians_, mapEditorCameraPitchRadians_);
+    const util::Vec3 direction = util::cameraForwardVector(mapEditorCameraYawRadians_, mapEditorCameraPitchRadians_);
     constexpr float kMaxDistance = 128.0f;
     constexpr float kStep = 0.20f;
     float bestDistance = std::numeric_limits<float>::max();
@@ -3055,14 +3091,13 @@ bool Application::buildMapEditorRay(util::Vec3& origin, util::Vec3& direction) c
         sampleY = std::clamp(static_cast<float>(lastInput_.mouseY), 0.0f, static_cast<float>(height - 1)) + 0.5f;
     }
 
-    const glm::mat4 projection = buildMapEditorProjectionMatrix(
-        mapEditorViewMode_,
+    const glm::mat4 projection = util::buildMapEditorProjectionMatrix(
+        mapEditorViewMode_ == MapEditorViewMode::Ortho25D,
         static_cast<float>(width),
         static_cast<float>(height),
         mapEditorOrthoSpan_);
-    const glm::mat4 view = buildMapEditorViewMatrix(
-        activeMap_,
-        mapEditorViewMode_,
+    const glm::mat4 view = util::buildMapEditorViewMatrix(
+        mapEditorViewMode_ == MapEditorViewMode::Ortho25D,
         mapEditorCameraPosition_,
         mapEditorCameraYawRadians_,
         mapEditorCameraPitchRadians_,
@@ -3070,7 +3105,7 @@ bool Application::buildMapEditorRay(util::Vec3& origin, util::Vec3& direction) c
     const glm::mat4 inverseProjectionView = glm::inverse(projection * view);
 
     const float ndcX = sampleX / static_cast<float>(width) * 2.0f - 1.0f;
-    const float ndcY = 1.0f - sampleY / static_cast<float>(height) * 2.0f;
+    const float ndcY = sampleY / static_cast<float>(height) * 2.0f - 1.0f;
     glm::vec4 nearPoint = inverseProjectionView * glm::vec4(ndcX, ndcY, 0.0f, 1.0f);
     glm::vec4 farPoint = inverseProjectionView * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
     if (std::abs(nearPoint.w) <= 0.0001f || std::abs(farPoint.w) <= 0.0001f) {
@@ -3086,7 +3121,7 @@ bool Application::buildMapEditorRay(util::Vec3& origin, util::Vec3& direction) c
         return false;
     }
 
-    if (mapEditorViewMode_ == MapEditorViewMode::OrthoTop) {
+    if (mapEditorViewMode_ == MapEditorViewMode::Ortho25D) {
         origin = nearWorld;
     } else {
         origin = mapEditorCameraPosition_;
@@ -3100,7 +3135,7 @@ gameplay::MapProp Application::buildMapEditorPlacementPreviewProp() const {
         : defaultFloatingEditorTargetPosition(
             activeMap_,
             mapEditorCameraPosition_,
-            cameraForwardVector(mapEditorCameraYawRadians_, mapEditorCameraPitchRadians_));
+            util::cameraForwardVector(mapEditorCameraYawRadians_, mapEditorCameraPitchRadians_));
     const util::Vec3 targetNormal = mapEditorTargetOnSurface_
         ? mapEditorTargetNormal_
         : util::Vec3{0.0f, 1.0f, 0.0f};
@@ -3145,7 +3180,7 @@ gameplay::SpawnPoint Application::buildMapEditorPlacementPreviewSpawn() const {
         : defaultFloatingEditorTargetPosition(
             activeMap_,
             mapEditorCameraPosition_,
-            cameraForwardVector(mapEditorCameraYawRadians_, mapEditorCameraPitchRadians_));
+            util::cameraForwardVector(mapEditorCameraYawRadians_, mapEditorCameraPitchRadians_));
     return gameplay::SpawnPoint{
         team,
         clampEditorTargetPosition(activeMap_, {targetPoint.x, targetPoint.y + kSinglePlayerEyeHeight, targetPoint.z}),
@@ -3818,8 +3853,8 @@ const char* Application::mapEditorViewModeLabel() const {
     switch (mapEditorViewMode_) {
         case MapEditorViewMode::Perspective:
             return "自由镜头";
-        case MapEditorViewMode::OrthoTop:
-            return "正交俯视";
+        case MapEditorViewMode::Ortho25D:
+            return "2.5D 正交";
     }
     return "自由镜头";
 }

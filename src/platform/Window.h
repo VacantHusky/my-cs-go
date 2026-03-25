@@ -52,6 +52,7 @@ struct InputSnapshot {
     int mouseY = 0;
     int mouseDeltaX = 0;
     int mouseDeltaY = 0;
+    int mouseWheelDelta = 0;
 };
 
 struct NativeEventObserver {

@@ -5,6 +5,7 @@
 #include "platform/Window.h"
 #include "util/FileSystem.h"
 #include "util/Log.h"
+#include "util/MapEditorCameraMath.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_sdl3.h>
@@ -416,6 +417,37 @@ struct TextureResource {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     bool valid = false;
+};
+
+struct QuantizedOutlinePoint {
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    std::int32_t z = 0;
+
+    bool operator<(const QuantizedOutlinePoint& other) const {
+        if (x != other.x) {
+            return x < other.x;
+        }
+        if (y != other.y) {
+            return y < other.y;
+        }
+        return z < other.z;
+    }
+};
+
+struct OutlineEdgeKey {
+    QuantizedOutlinePoint a{};
+    QuantizedOutlinePoint b{};
+
+    bool operator<(const OutlineEdgeKey& other) const {
+        if (a < other.a) {
+            return true;
+        }
+        if (other.a < a) {
+            return false;
+        }
+        return b < other.b;
+    }
 };
 
 struct StreamingBuffer {
@@ -1075,53 +1107,6 @@ std::optional<ProjectedVertex> projectWorldPoint(const glm::mat4& projectionView
     };
 }
 
-glm::mat4 buildMapEditorProjectionMatrix(const RenderFrame& renderFrame,
-                                         const float widthPx,
-                                         const float heightPx) {
-    const float safeHeight = std::max(1.0f, heightPx);
-    const float aspect = widthPx / safeHeight;
-    if (renderFrame.editorIsOrthoView) {
-        const float span = std::max(4.0f, renderFrame.editorOrthoSpan);
-        glm::mat4 projection = glm::orthoRH_ZO(
-            -span * aspect,
-            span * aspect,
-            -span,
-            span,
-            0.05f,
-            256.0f);
-        projection[1][1] *= -1.0f;
-        return projection;
-    }
-
-    glm::mat4 projection = glm::perspectiveRH_ZO(1.08f, aspect, 0.05f, 192.0f);
-    projection[1][1] *= -1.0f;
-    return projection;
-}
-
-glm::mat4 buildMapEditorViewMatrix(const RenderFrame& renderFrame,
-                                   const gameplay::MapData& map) {
-    if (renderFrame.editorIsOrthoView) {
-        const float eyeHeight = std::max(
-            static_cast<float>(std::max(map.height, 8)) + 12.0f,
-            renderFrame.editorOrthoSpan * 2.2f);
-        return glm::lookAtRH(
-            glm::vec3(renderFrame.cameraPosition.x, eyeHeight, renderFrame.cameraPosition.z),
-            glm::vec3(renderFrame.cameraPosition.x, 0.0f, renderFrame.cameraPosition.z),
-            glm::vec3(0.0f, 0.0f, -1.0f));
-    }
-
-    const util::Vec3 eye = renderFrame.cameraPosition;
-    const util::Vec3 target{
-        eye.x + std::cos(renderFrame.cameraYawRadians) * std::cos(renderFrame.cameraPitchRadians),
-        eye.y + std::sin(renderFrame.cameraPitchRadians),
-        eye.z + std::sin(renderFrame.cameraYawRadians) * std::cos(renderFrame.cameraPitchRadians),
-    };
-    return glm::lookAtRH(
-        glm::vec3(eye.x, eye.y, eye.z),
-        glm::vec3(target.x, target.y, target.z),
-        glm::vec3(0.0f, 1.0f, 0.0f));
-}
-
 std::array<util::Vec3, 8> buildEditorPropOutlineCorners(const gameplay::MapProp& prop) {
     const util::Vec3 half = editorPropOutlineHalfExtents(prop);
     const glm::mat4 transform =
@@ -1215,6 +1200,133 @@ bool recordPropOutline(VulkanDispatch& dispatch,
         const auto& a = projectedCorners[static_cast<std::size_t>(edge[0])];
         const auto& b = projectedCorners[static_cast<std::size_t>(edge[1])];
         recordProjectedLine(dispatch, commandBuffer, extent, attachment, a.x, a.y, b.x, b.y, thicknessPx);
+    }
+
+    if (outMinY != nullptr) {
+        *outMinY = minY;
+    }
+    if (outMidX != nullptr) {
+        *outMidX = (minX + maxX) * 0.5f;
+    }
+    return true;
+}
+
+QuantizedOutlinePoint quantizeOutlinePoint(const vulkan::MeshVertex& vertex) {
+    constexpr float kOutlineQuantizationScale = 10000.0f;
+    return {
+        static_cast<std::int32_t>(std::lround(vertex.px * kOutlineQuantizationScale)),
+        static_cast<std::int32_t>(std::lround(vertex.py * kOutlineQuantizationScale)),
+        static_cast<std::int32_t>(std::lround(vertex.pz * kOutlineQuantizationScale)),
+    };
+}
+
+OutlineEdgeKey makeOutlineEdgeKey(const vulkan::MeshVertex& lhs,
+                                  const vulkan::MeshVertex& rhs) {
+    QuantizedOutlinePoint a = quantizeOutlinePoint(lhs);
+    QuantizedOutlinePoint b = quantizeOutlinePoint(rhs);
+    if (b < a) {
+        std::swap(a, b);
+    }
+    return {a, b};
+}
+
+bool recordPropMeshSilhouette(VulkanDispatch& dispatch,
+                              const VkCommandBuffer commandBuffer,
+                              const VkExtent2D extent,
+                              const glm::mat4& projectionView,
+                              const glm::mat4& model,
+                              const vulkan::CpuMesh& mesh,
+                              const VkClearAttachment& attachment,
+                              const float thicknessPx,
+                              float* outMinY = nullptr,
+                              float* outMidX = nullptr) {
+    if (!mesh.valid || mesh.vertices.size() < 3) {
+        return false;
+    }
+
+    struct SilhouetteEdge {
+        ProjectedVertex a{};
+        ProjectedVertex b{};
+        int totalCount = 0;
+        int frontFacingCount = 0;
+    };
+
+    std::map<OutlineEdgeKey, SilhouetteEdge> edges;
+    float minY = static_cast<float>(extent.height);
+    float minX = static_cast<float>(extent.width);
+    float maxX = 0.0f;
+    bool anyProjected = false;
+
+    for (std::size_t index = 0; index + 2 < mesh.vertices.size(); index += 3) {
+        const vulkan::MeshVertex& aVertex = mesh.vertices[index];
+        const vulkan::MeshVertex& bVertex = mesh.vertices[index + 1];
+        const vulkan::MeshVertex& cVertex = mesh.vertices[index + 2];
+
+        const glm::vec4 worldA = model * glm::vec4(aVertex.px, aVertex.py, aVertex.pz, 1.0f);
+        const glm::vec4 worldB = model * glm::vec4(bVertex.px, bVertex.py, bVertex.pz, 1.0f);
+        const glm::vec4 worldC = model * glm::vec4(cVertex.px, cVertex.py, cVertex.pz, 1.0f);
+
+        const auto projectedA = projectWorldPoint(projectionView, {worldA.x, worldA.y, worldA.z},
+            static_cast<float>(extent.width), static_cast<float>(extent.height));
+        const auto projectedB = projectWorldPoint(projectionView, {worldB.x, worldB.y, worldB.z},
+            static_cast<float>(extent.width), static_cast<float>(extent.height));
+        const auto projectedC = projectWorldPoint(projectionView, {worldC.x, worldC.y, worldC.z},
+            static_cast<float>(extent.width), static_cast<float>(extent.height));
+        if (!projectedA.has_value() || !projectedB.has_value() || !projectedC.has_value()) {
+            continue;
+        }
+
+        anyProjected = true;
+        minY = std::min({minY, projectedA->y, projectedB->y, projectedC->y});
+        minX = std::min({minX, projectedA->x, projectedB->x, projectedC->x});
+        maxX = std::max({maxX, projectedA->x, projectedB->x, projectedC->x});
+
+        const float signedArea =
+            (projectedB->x - projectedA->x) * (projectedC->y - projectedA->y) -
+            (projectedB->y - projectedA->y) * (projectedC->x - projectedA->x);
+        if (std::abs(signedArea) <= 0.001f) {
+            continue;
+        }
+
+        const bool frontFacing = signedArea < 0.0f;
+        const auto accumulateEdge = [&](const vulkan::MeshVertex& lhs,
+                                        const vulkan::MeshVertex& rhs,
+                                        const ProjectedVertex& projectedLhs,
+                                        const ProjectedVertex& projectedRhs) {
+            SilhouetteEdge& edge = edges[makeOutlineEdgeKey(lhs, rhs)];
+            edge.a = projectedLhs;
+            edge.b = projectedRhs;
+            ++edge.totalCount;
+            if (frontFacing) {
+                ++edge.frontFacingCount;
+            }
+        };
+
+        accumulateEdge(aVertex, bVertex, *projectedA, *projectedB);
+        accumulateEdge(bVertex, cVertex, *projectedB, *projectedC);
+        accumulateEdge(cVertex, aVertex, *projectedC, *projectedA);
+    }
+
+    if (!anyProjected || edges.empty()) {
+        return false;
+    }
+
+    bool drewAnyEdge = false;
+    for (const auto& [key, edge] : edges) {
+        (void)key;
+        const bool isBoundary = edge.totalCount == 1;
+        const bool isSilhouette = edge.frontFacingCount > 0 && edge.frontFacingCount < edge.totalCount;
+        const bool isVisibleOpenEdge = isBoundary && edge.frontFacingCount > 0;
+        if (!isSilhouette && !isVisibleOpenEdge) {
+            continue;
+        }
+        drewAnyEdge = true;
+        recordProjectedLine(dispatch, commandBuffer, extent, attachment,
+            edge.a.x, edge.a.y, edge.b.x, edge.b.y, thicknessPx);
+    }
+
+    if (!drewAnyEdge) {
+        return false;
     }
 
     if (outMinY != nullptr) {
@@ -1409,6 +1521,7 @@ private:
     struct CachedGpuMesh {
         std::string path;
         GpuBuffer buffer;
+        vulkan::CpuMesh cpuMesh;
     };
 
     struct CachedTexture {
@@ -1787,13 +1900,13 @@ private:
                         queueUiAction(UiActionType::ToggleMapEditorProjection);
                     }
                     ImGui::SameLine();
-                    if (ImGui::Selectable("正交俯视", renderFrame.editorIsOrthoView, 0, ImVec2(120.0f, 0.0f)) &&
+                    if (ImGui::Selectable("2.5D 正交", renderFrame.editorIsOrthoView, 0, ImVec2(120.0f, 0.0f)) &&
                         !renderFrame.editorIsOrthoView) {
                         queueUiAction(UiActionType::ToggleMapEditorProjection);
                     }
                     ImGui::TextWrapped(
                         renderFrame.editorIsOrthoView
-                            ? "正交视图下使用 WASD 平移，Space/Ctrl 缩放。"
+                            ? "2.5D 正交视图下使用 WASD 平移，滚轮缩放，Space/Ctrl 也可缩放。"
                             : "自由镜头下按住右键环视，WASD 飞行，Space/Ctrl 升降。");
 
                     if (renderFrame.editorToolLabel == "放置") {
@@ -3032,14 +3145,34 @@ private:
             }
         }
 
-        vulkan::CpuMesh cpuMesh = vulkan::loadMeshAsset(rendererAssetRootPath(), path);
-        CachedGpuMesh cached{.path = key, .buffer = {}};
-        if (!uploadMesh(cpuMesh, cached.buffer)) {
+        CachedGpuMesh cached{.path = key, .buffer = {}, .cpuMesh = vulkan::loadMeshAsset(rendererAssetRootPath(), path)};
+        if (!uploadMesh(cached.cpuMesh, cached.buffer)) {
             gpuMeshCache_.push_back(std::move(cached));
             return nullptr;
         }
         gpuMeshCache_.push_back(std::move(cached));
         return &gpuMeshCache_.back().buffer;
+    }
+
+    const vulkan::CpuMesh* cachedSourceCpuMesh(const std::filesystem::path& path) {
+        if (path.empty()) {
+            return nullptr;
+        }
+        const std::string key = path.generic_string();
+        for (auto& cached : gpuMeshCache_) {
+            if (cached.path == key) {
+                return cached.cpuMesh.valid && cached.cpuMesh.vertices.size() >= 3 ? &cached.cpuMesh : nullptr;
+            }
+        }
+
+        CachedGpuMesh cached{.path = key, .buffer = {}, .cpuMesh = vulkan::loadMeshAsset(rendererAssetRootPath(), path)};
+        if (cached.cpuMesh.valid) {
+            uploadMesh(cached.cpuMesh, cached.buffer);
+        }
+        gpuMeshCache_.push_back(std::move(cached));
+        return gpuMeshCache_.back().cpuMesh.valid && gpuMeshCache_.back().cpuMesh.vertices.size() >= 3
+            ? &gpuMeshCache_.back().cpuMesh
+            : nullptr;
     }
 
     bool ensureStaticWorldMesh(const gameplay::MapData& map) {
@@ -4172,8 +4305,17 @@ private:
         const auto& map = *renderFrame.editingMap;
         const float widthPx = static_cast<float>(swapchainExtent_.width);
         const float heightPx = static_cast<float>(swapchainExtent_.height);
-        const glm::mat4 projection = buildMapEditorProjectionMatrix(renderFrame, widthPx, heightPx);
-        const glm::mat4 view = buildMapEditorViewMatrix(renderFrame, map);
+        const glm::mat4 projection = util::buildMapEditorProjectionMatrix(
+            renderFrame.editorIsOrthoView,
+            widthPx,
+            heightPx,
+            renderFrame.editorOrthoSpan);
+        const glm::mat4 view = util::buildMapEditorViewMatrix(
+            renderFrame.editorIsOrthoView,
+            renderFrame.cameraPosition,
+            renderFrame.cameraYawRadians,
+            renderFrame.cameraPitchRadians,
+            renderFrame.editorOrthoSpan);
         const glm::mat4 projectionView = projection * view;
         const VkViewport viewport{0.0f, 0.0f, widthPx, heightPx, 0.0f, 1.0f};
         const VkRect2D scissor{{0, 0}, swapchainExtent_};
@@ -4258,26 +4400,48 @@ private:
                 8.0f);
         }
 
+        const auto meshOutlineColor = makeAttachment(0.28f, 0.96f, 0.48f);
+        const auto collisionOutlineColor = makeAttachment(0.30f, 0.58f, 0.98f);
+
         const auto drawOutlinedProp = [&](const int propIndex,
-                                          const VkClearAttachment& outlineColor,
-                                          const float thicknessPx,
+                                          const float meshThicknessPx,
+                                          const float collisionThicknessPx,
                                           const std::string& label) {
             if (propIndex < 0 || propIndex >= static_cast<int>(map.props.size())) {
                 return;
             }
+            const gameplay::MapProp& prop = map.props[static_cast<std::size_t>(propIndex)];
             float labelMinY = 0.0f;
             float labelMidX = 0.0f;
-            if (recordPropOutline(
+
+            bool drewMeshOutline = false;
+            if (const auto* cpuMesh = cachedSourceCpuMesh(prop.modelPath); cpuMesh != nullptr) {
+                drewMeshOutline = recordPropMeshSilhouette(
                     dispatch_,
                     commandBuffer,
                     swapchainExtent_,
                     projectionView,
-                    map.props[static_cast<std::size_t>(propIndex)],
-                    outlineColor,
-                    thicknessPx,
+                    buildPropModelMatrix(prop),
+                    *cpuMesh,
+                    meshOutlineColor,
+                    meshThicknessPx,
                     &labelMinY,
-                    &labelMidX)) {
-                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, outlineColor,
+                    &labelMidX);
+            }
+
+            const bool drewCollisionOutline = recordPropOutline(
+                dispatch_,
+                commandBuffer,
+                swapchainExtent_,
+                projectionView,
+                prop,
+                collisionOutlineColor,
+                collisionThicknessPx,
+                drewMeshOutline ? nullptr : &labelMinY,
+                drewMeshOutline ? nullptr : &labelMidX);
+
+            if (drewMeshOutline || drewCollisionOutline) {
+                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, meshOutlineColor,
                     labelMidX, std::max(18.0f, labelMinY - 8.0f), widenUtf8(label), 0.28f, 0.02f);
             }
         };
@@ -4287,17 +4451,15 @@ private:
             renderFrame.selectedEditorPropIndex != renderFrame.eraseEditorPropIndex) {
             drawOutlinedProp(
                 renderFrame.selectedEditorPropIndex,
-                makeAttachment(0.92f, 0.76f, 0.30f),
-                2.0f,
+                2.4f,
+                1.8f,
                 renderFrame.selectedEditorPropLabel);
         }
         if (renderFrame.hoveredEditorPropIndex >= 0) {
             drawOutlinedProp(
                 renderFrame.hoveredEditorPropIndex,
-                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex
-                    ? makeAttachment(0.98f, 0.40f, 0.26f)
-                    : makeAttachment(0.99f, 0.88f, 0.46f),
-                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex ? 3.5f : 3.0f,
+                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex ? 3.8f : 3.2f,
+                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex ? 2.8f : 2.2f,
                 renderFrame.hoveredEditorPropIndex == renderFrame.selectedEditorPropIndex
                     ? renderFrame.selectedEditorPropLabel
                     : describeEditorPropLabel(map.props[static_cast<std::size_t>(renderFrame.hoveredEditorPropIndex)]));
@@ -4305,17 +4467,33 @@ private:
         if (renderFrame.editorPlacementPreviewKind == RenderFrame::EditorPlacementPreviewKind::Prop) {
             float labelMinY = 0.0f;
             float labelMidX = 0.0f;
-            if (recordPropOutline(
+            bool drewPreviewMesh = false;
+            if (const auto* previewCpuMesh = cachedSourceCpuMesh(renderFrame.editorPlacementPreviewProp.modelPath);
+                previewCpuMesh != nullptr) {
+                drewPreviewMesh = recordPropMeshSilhouette(
                     dispatch_,
                     commandBuffer,
                     swapchainExtent_,
                     projectionView,
-                    renderFrame.editorPlacementPreviewProp,
-                    makeAttachment(0.46f, 0.92f, 0.98f),
-                    2.5f,
+                    buildPropModelMatrix(renderFrame.editorPlacementPreviewProp),
+                    *previewCpuMesh,
+                    meshOutlineColor,
+                    2.6f,
                     &labelMinY,
-                    &labelMidX)) {
-                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, makeAttachment(0.46f, 0.92f, 0.98f),
+                    &labelMidX);
+            }
+            const bool drewPreviewCollision = recordPropOutline(
+                dispatch_,
+                commandBuffer,
+                swapchainExtent_,
+                projectionView,
+                renderFrame.editorPlacementPreviewProp,
+                collisionOutlineColor,
+                2.0f,
+                drewPreviewMesh ? nullptr : &labelMinY,
+                drewPreviewMesh ? nullptr : &labelMidX);
+            if (drewPreviewMesh || drewPreviewCollision) {
+                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, meshOutlineColor,
                     labelMidX, std::max(18.0f, labelMinY - 8.0f), L"放置预览", 0.26f, 0.02f);
             }
         }
@@ -4405,7 +4583,7 @@ private:
             widthPx * 0.74f, heightPx * 0.20f, widenUtf8(selectionStatus.str()), 0.30f, 0.03f, 1.04f);
 
         const std::wstring lookHint = renderFrame.editorIsOrthoView
-            ? L"正交规划视图"
+            ? L"2.5D 规划视图"
             : (renderFrame.editorMouseLookActive
                 ? L"环视中"
                 : L"鼠标指向编辑");
@@ -4414,7 +4592,7 @@ private:
         recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, bodyColor,
             widthPx * 0.20f, heightPx * 0.935f,
             renderFrame.editorIsOrthoView
-                ? L"WASD 平移  Space/Ctrl 缩放  1 选择  2 放置  3 擦除  G 放置类型  O 视图切换  Ctrl+Z 撤销"
+                ? L"WASD 平移  滚轮缩放  Space/Ctrl 微调缩放  1 选择  2 放置  3 擦除  G 放置类型  O 切换 2.5D 视图  Ctrl+Z 撤销"
                 : L"右键环视  鼠标悬停选择  1 选择  2 放置  3 擦除  G 放置类型  R 旋转  Tab 缩放  O 视图切换  Ctrl+Z 撤销",
             0.29f, 0.03f);
         recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, accentColor,

@@ -46,12 +46,17 @@ enum class MapEditorPlacementKind {
 
 enum class MapEditorViewMode {
     Perspective,
-    OrthoTop,
+    Ortho25D,
+};
+
+enum class ApplicationLaunchMode {
+    Game,
+    Editor,
 };
 
 class Application {
 public:
-    Application();
+    explicit Application(ApplicationLaunchMode launchMode = ApplicationLaunchMode::Game);
     ~Application();
 
     int run();
@@ -71,6 +76,7 @@ private:
     void returnToMainMenu(std::string_view statusOverride = {});
     void initializeSinglePlayerView();
     void initializeMapEditorView();
+    void initializeLaunchFlow();
     void updateSinglePlayerView(const platform::InputSnapshot& input, float deltaSeconds);
     void updateMapEditorView(const platform::InputSnapshot& input, float deltaSeconds);
     gameplay::PlayerState buildNetworkLocalPlayerState() const;
@@ -130,6 +136,11 @@ private:
     gameplay::MapData makeBlankEditorMap(const std::string& name) const;
     std::filesystem::path nextCustomMapPath() const;
     void saveActiveMapArtifacts(const char* reason);
+    void switchMapEditorViewMode(MapEditorViewMode nextMode);
+    void syncMapEditorCameraState();
+    util::Vec3 clampMapEditorPerspectiveCameraPosition(const util::Vec3& position) const;
+    util::Vec3 clampMapEditorOrthoFocusPosition(const util::Vec3& position) const;
+    util::Vec3 deriveMapEditorFocusPointFromPerspective() const;
     const char* mapEditorToolLabel() const;
     const char* mapEditorPlacementKindLabel() const;
     const char* mapEditorViewModeLabel() const;
@@ -154,6 +165,7 @@ private:
     audio::AudioSystem audioSystem_;
     std::unique_ptr<platform::IWindow> window_;
     std::unique_ptr<renderer::IRenderer> renderer_;
+    ApplicationLaunchMode launchMode_ = ApplicationLaunchMode::Game;
     AppFlow currentFlow_ = AppFlow::MainMenu;
     AppFlow mapBrowserTargetFlow_ = AppFlow::SinglePlayerLobby;
     std::size_t selectedMenuIndex_ = 0;
@@ -167,6 +179,11 @@ private:
     util::Vec3 mapEditorCameraPosition_{};
     float mapEditorCameraYawRadians_ = 0.0f;
     float mapEditorCameraPitchRadians_ = 0.0f;
+    util::Vec3 mapEditorPerspectiveCameraPosition_{};
+    float mapEditorPerspectiveCameraYawRadians_ = 0.0f;
+    float mapEditorPerspectiveCameraPitchRadians_ = 0.0f;
+    util::Vec3 mapEditorPerspectiveFocusOffset_{};
+    util::Vec3 mapEditorOrthoFocusPosition_{};
     util::Vec3 mapEditorTargetPosition_{};
     util::Vec3 mapEditorTargetNormal_{0.0f, 1.0f, 0.0f};
     bool mapEditorHasTarget_ = false;

@@ -67,6 +67,7 @@ public:
                     hasFocus_ = false;
                     accumulatedMouseDeltaX_ = 0;
                     accumulatedMouseDeltaY_ = 0;
+                    accumulatedMouseWheelDelta_ = 0;
                     ctrlHeld_ = false;
                     moveDownHeld_ = false;
                     break;
@@ -97,6 +98,9 @@ public:
                     if (event.button.button == SDL_BUTTON_RIGHT) {
                         secondaryClickHeld_ = false;
                     }
+                    break;
+                case SDL_EVENT_MOUSE_WHEEL:
+                    accumulatedMouseWheelDelta_ += static_cast<int>(event.wheel.y);
                     break;
                 default:
                     break;
@@ -136,6 +140,7 @@ public:
         snapshot.secondaryClickHeld = secondaryClickHeld_;
         snapshot.mouseDeltaX = accumulatedMouseDeltaX_;
         snapshot.mouseDeltaY = accumulatedMouseDeltaY_;
+        snapshot.mouseWheelDelta = accumulatedMouseWheelDelta_;
 
         input_.upPressed = false;
         input_.downPressed = false;
@@ -164,6 +169,7 @@ public:
         input_.primaryClickPressed = false;
         accumulatedMouseDeltaX_ = 0;
         accumulatedMouseDeltaY_ = 0;
+        accumulatedMouseWheelDelta_ = 0;
         return snapshot;
     }
 
@@ -495,6 +501,7 @@ private:
     bool secondaryClickHeld_ = false;
     int accumulatedMouseDeltaX_ = 0;
     int accumulatedMouseDeltaY_ = 0;
+    int accumulatedMouseWheelDelta_ = 0;
     NativeEventObserver eventObserver_{};
     RepeatState upRepeatState_{};
     RepeatState downRepeatState_{};

@@ -30,22 +30,33 @@ struct InputSnapshot {
     bool selectToolFivePressed = false;
     bool cycleThrowablePressed = false;
     bool cycleOpticPressed = false;
+    bool ctrlHeld = false;
     bool editorSavePressed = false;
     bool editorDeletePressed = false;
     bool editorPreviousMapPressed = false;
     bool editorNextMapPressed = false;
     bool editorNewMapPressed = false;
+    bool editorUndoPressed = false;
+    bool editorToggleProjectionPressed = false;
     bool moveForwardHeld = false;
     bool moveBackwardHeld = false;
+    bool moveUpHeld = false;
+    bool moveDownHeld = false;
     bool strafeLeftHeld = false;
     bool strafeRightHeld = false;
     bool turnLeftHeld = false;
     bool turnRightHeld = false;
     bool primaryClickPressed = false;
+    bool secondaryClickHeld = false;
     int mouseX = 0;
     int mouseY = 0;
     int mouseDeltaX = 0;
     int mouseDeltaY = 0;
+};
+
+struct NativeEventObserver {
+    void (*callback)(const void* event, void* userData) = nullptr;
+    void* userData = nullptr;
 };
 
 class IWindow {
@@ -62,6 +73,7 @@ public:
     virtual int clientWidth() const = 0;
     virtual int clientHeight() const = 0;
     virtual void setRelativeMouseMode(bool enabled) = 0;
+    virtual void setNativeEventObserver(NativeEventObserver observer) = 0;
 };
 
 std::unique_ptr<IWindow> createWindow();

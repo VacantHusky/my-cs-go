@@ -3,6 +3,7 @@
 #include "util/FileSystem.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <sstream>
 #include <vector>
@@ -83,6 +84,97 @@ std::string makeCubeObj() {
         "f 5/1 1/2 4/3 8/4\n";
 }
 
+struct HumanoidBox {
+    const char* material = "";
+    float minX = 0.0f;
+    float minY = 0.0f;
+    float minZ = 0.0f;
+    float maxX = 0.0f;
+    float maxY = 0.0f;
+    float maxZ = 0.0f;
+};
+
+void appendHumanoidBox(std::ostringstream& out, int& nextVertexIndex, const HumanoidBox& box) {
+    out << "usemtl " << box.material << '\n';
+    out << "v " << box.minX << ' ' << box.minY << ' ' << box.minZ << '\n';
+    out << "v " << box.maxX << ' ' << box.minY << ' ' << box.minZ << '\n';
+    out << "v " << box.maxX << ' ' << box.maxY << ' ' << box.minZ << '\n';
+    out << "v " << box.minX << ' ' << box.maxY << ' ' << box.minZ << '\n';
+    out << "v " << box.minX << ' ' << box.minY << ' ' << box.maxZ << '\n';
+    out << "v " << box.maxX << ' ' << box.minY << ' ' << box.maxZ << '\n';
+    out << "v " << box.maxX << ' ' << box.maxY << ' ' << box.maxZ << '\n';
+    out << "v " << box.minX << ' ' << box.maxY << ' ' << box.maxZ << '\n';
+
+    const int base = nextVertexIndex;
+    out << "f " << base + 0 << ' ' << base + 3 << ' ' << base + 2 << ' ' << base + 1 << '\n';
+    out << "f " << base + 4 << ' ' << base + 5 << ' ' << base + 6 << ' ' << base + 7 << '\n';
+    out << "f " << base + 0 << ' ' << base + 1 << ' ' << base + 5 << ' ' << base + 4 << '\n';
+    out << "f " << base + 1 << ' ' << base + 2 << ' ' << base + 6 << ' ' << base + 5 << '\n';
+    out << "f " << base + 3 << ' ' << base + 7 << ' ' << base + 6 << ' ' << base + 2 << '\n';
+    out << "f " << base + 0 << ' ' << base + 4 << ' ' << base + 7 << ' ' << base + 3 << '\n';
+    nextVertexIndex += 8;
+}
+
+std::string makeHumanoidObj() {
+    std::ostringstream out;
+    out << "mtllib lowpoly_operator.mtl\n";
+    out << "o lowpoly_operator\n";
+
+    int nextVertexIndex = 1;
+    constexpr std::array<HumanoidBox, 11> kBoxes{{
+        {"boots", -0.10f, 0.00f, -0.11f, 0.10f, 0.12f, 0.08f},
+        {"boots", -0.10f, 0.00f,  0.15f, 0.10f, 0.12f, 0.34f},
+        {"pants", -0.11f, 0.12f, -0.08f, 0.11f, 0.72f, 0.06f},
+        {"pants", -0.11f, 0.12f,  0.18f, 0.11f, 0.72f, 0.32f},
+        {"vest", -0.22f, 0.72f, -0.18f, 0.22f, 1.26f, 0.38f},
+        {"vest", -0.28f, 0.86f, -0.22f, 0.28f, 1.18f, 0.42f},
+        {"skin", -0.13f, 1.26f, -0.06f, 0.13f, 1.40f, 0.28f},
+        {"skin", -0.20f, 1.40f, -0.10f, 0.20f, 1.76f, 0.32f},
+        {"skin", -0.39f, 0.86f, -0.05f, -0.23f, 1.18f, 0.09f},
+        {"skin",  0.23f, 0.86f, -0.05f,  0.39f, 1.18f, 0.09f},
+        {"visor", 0.14f, 1.48f,  0.04f, 0.22f, 1.64f, 0.20f},
+    }};
+
+    for (const HumanoidBox& box : kBoxes) {
+        appendHumanoidBox(out, nextVertexIndex, box);
+    }
+
+    return out.str();
+}
+
+std::string makeHumanoidMtl() {
+    return
+        "newmtl skin\n"
+        "Kd 0.86 0.72 0.62\n"
+        "Ka 0.10 0.08 0.06\n"
+        "Ks 0.02 0.02 0.02\n"
+        "Ns 12.0\n"
+        "\n"
+        "newmtl vest\n"
+        "Kd 0.34 0.38 0.42\n"
+        "Ka 0.06 0.07 0.08\n"
+        "Ks 0.02 0.02 0.02\n"
+        "Ns 12.0\n"
+        "\n"
+        "newmtl pants\n"
+        "Kd 0.22 0.27 0.31\n"
+        "Ka 0.05 0.06 0.07\n"
+        "Ks 0.02 0.02 0.02\n"
+        "Ns 12.0\n"
+        "\n"
+        "newmtl boots\n"
+        "Kd 0.10 0.11 0.12\n"
+        "Ka 0.03 0.03 0.03\n"
+        "Ks 0.01 0.01 0.01\n"
+        "Ns 8.0\n"
+        "\n"
+        "newmtl visor\n"
+        "Kd 0.18 0.30 0.36\n"
+        "Ka 0.04 0.07 0.08\n"
+        "Ks 0.05 0.05 0.05\n"
+        "Ns 18.0\n";
+}
+
 std::vector<OpticType> commonOptics() {
     return {OpticType::RedDot, OpticType::X2, OpticType::X4, OpticType::X8};
 }
@@ -93,6 +185,7 @@ void ContentDatabase::bootstrap(const std::filesystem::path& assetRoot) {
     createPlaceholderAssets(assetRoot);
     createMaterialProfiles(assetRoot);
     createWeaponCatalog(assetRoot);
+    createCharacterCatalog(assetRoot);
 }
 
 void ContentDatabase::createPlaceholderAssets(const std::filesystem::path& assetRoot) {
@@ -101,9 +194,12 @@ void ContentDatabase::createPlaceholderAssets(const std::filesystem::path& asset
     util::FileSystem::ensureDirectory(generatedDir / "models");
     util::FileSystem::ensureDirectory(generatedDir / "textures");
     util::FileSystem::ensureDirectory(generatedDir / "materials");
+    util::FileSystem::ensureDirectory(assetRoot / "source" / "characters");
 
     util::FileSystem::writeText(generatedDir / "models" / "crate.obj", makeCubeObj());
     util::FileSystem::writeText(generatedDir / "models" / "weapon_placeholder.obj", makeCubeObj());
+    util::FileSystem::writeText(generatedDir / "models" / "lowpoly_operator.obj", makeHumanoidObj());
+    util::FileSystem::writeText(generatedDir / "models" / "lowpoly_operator.mtl", makeHumanoidMtl());
     util::FileSystem::writeText(generatedDir / "materials" / "default.mat",
         "albedo=generated/textures/metal_gray.bmp\nroughness=0.65\nmetallic=0.3\n");
     util::FileSystem::writeText(generatedDir / "materials" / "polyhaven_concrete_wall_006.mat",
@@ -131,15 +227,29 @@ void ContentDatabase::createPlaceholderAssets(const std::filesystem::path& asset
         "normal=source/polyhaven/models/Barrel_02/textures/Barrel_02_nor_gl_1k.jpg\n"
         "arm=source/polyhaven/models/Barrel_02/textures/Barrel_02_arm_1k.jpg\n"
         "metallic=0.35\n");
+    util::FileSystem::writeText(generatedDir / "materials" / "classic64_box_shipping_01.mat",
+        "albedo=source/itchio/classic64/Boxes/Materials/box_shipping_01.jpg\n"
+        "roughness=0.78\n"
+        "metallic=0.02\n");
+    util::FileSystem::writeText(generatedDir / "materials" / "classic64_concrete_floor_01.mat",
+        "albedo=source/itchio/classic64/Concrete/Materials/concrete_floor_01.jpg\n"
+        "roughness=0.86\n"
+        "metallic=0.01\n");
     util::FileSystem::writeText(generatedDir / "materials" / "quaternius_metal.mat",
         "albedo=generated/textures/metal_gray.bmp\nroughness=0.42\nmetallic=0.62\n");
     util::FileSystem::writeText(generatedDir / "materials" / "quaternius_polymer.mat",
         "albedo=generated/textures/polymer_black.bmp\nroughness=0.78\nmetallic=0.08\n");
     util::FileSystem::writeText(generatedDir / "materials" / "quaternius_wood.mat",
         "albedo=generated/textures/wood_walnut.bmp\nroughness=0.70\nmetallic=0.02\n");
+    util::FileSystem::writeText(generatedDir / "materials" / "bomb_site_a.mat",
+        "albedo=generated/textures/site_a_red.bmp\nroughness=0.76\nmetallic=0.02\n");
+    util::FileSystem::writeText(generatedDir / "materials" / "bomb_site_b.mat",
+        "albedo=generated/textures/site_b_blue.bmp\nroughness=0.76\nmetallic=0.02\n");
     util::FileSystem::writeBinary(generatedDir / "textures" / "metal_gray.bmp", makeBmp(132, 138, 148));
     util::FileSystem::writeBinary(generatedDir / "textures" / "polymer_black.bmp", makeBmp(54, 56, 62));
     util::FileSystem::writeBinary(generatedDir / "textures" / "wood_walnut.bmp", makeBmp(112, 74, 48));
+    util::FileSystem::writeBinary(generatedDir / "textures" / "site_a_red.bmp", makeBmp(170, 72, 60));
+    util::FileSystem::writeBinary(generatedDir / "textures" / "site_b_blue.bmp", makeBmp(66, 100, 176));
     util::FileSystem::writeBinary(generatedDir / "textures" / "smoke_soft.bmp", makeBmp(164, 174, 182));
     util::FileSystem::writeBinary(generatedDir / "textures" / "flash_white.bmp", makeBmp(235, 235, 228));
 }
@@ -195,6 +305,24 @@ void ContentDatabase::createMaterialProfiles(const std::filesystem::path& assetR
             .roughnessPath = polyhavenRoot / "materials" / "painted_concrete" / "painted_concrete_rough_2k.jpg",
         });
     }
+    if (util::FileSystem::exists(assetRoot / "source" / "itchio" / "classic64" / "Boxes" / "Materials" / "box_shipping_01.jpg")) {
+        materials_.push_back(MaterialProfile{
+            .id = "classic64_box_shipping_01",
+            .displayName = "Classic64 货运箱",
+            .albedoPath = assetRoot / "source" / "itchio" / "classic64" / "Boxes" / "Materials" / "box_shipping_01.jpg",
+            .normalPath = {},
+            .roughnessPath = {},
+        });
+    }
+    if (util::FileSystem::exists(assetRoot / "source" / "itchio" / "classic64" / "Concrete" / "Materials" / "concrete_floor_01.jpg")) {
+        materials_.push_back(MaterialProfile{
+            .id = "classic64_concrete_floor_01",
+            .displayName = "Classic64 混凝土地面",
+            .albedoPath = assetRoot / "source" / "itchio" / "classic64" / "Concrete" / "Materials" / "concrete_floor_01.jpg",
+            .normalPath = {},
+            .roughnessPath = {},
+        });
+    }
 }
 
 void ContentDatabase::createWeaponCatalog(const std::filesystem::path& assetRoot) {
@@ -238,6 +366,37 @@ void ContentDatabase::createWeaponCatalog(const std::filesystem::path& assetRoot
     weapons_.push_back({"frag", "破片手雷", WeaponCategory::Grenade, 1, 2, 120.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, true, true, {}, {model, metal, material}});
     weapons_.push_back({"flashbang", "闪光弹", WeaponCategory::Grenade, 1, 2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, true, true, {}, {model, assetRoot / "generated" / "textures" / "flash_white.bmp", material}});
     weapons_.push_back({"smoke", "烟雾弹", WeaponCategory::Grenade, 1, 2, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, true, true, {}, {model, assetRoot / "generated" / "textures" / "smoke_soft.bmp", material}});
+}
+
+void ContentDatabase::createCharacterCatalog(const std::filesystem::path& assetRoot) {
+    characters_.clear();
+
+    const auto generatedModel = assetRoot / "generated" / "models" / "lowpoly_operator.obj";
+    const auto demeliusModel = assetRoot / "source" / "characters" / "demelius_low_poly" / "Low-poly_character.glb";
+    const bool hasDemeliusModel = util::FileSystem::exists(demeliusModel);
+
+    characters_.push_back(CharacterDefinition{
+        .id = "default_operator",
+        .displayName = hasDemeliusModel ? "低模干员（外部资源）" : "低模干员（内置）",
+        .assets = {
+            .modelPath = hasDemeliusModel ? demeliusModel : generatedModel,
+            .albedoPath = {},
+            .materialPath = {},
+        },
+        .modelScale = 1.0f,
+        .yawOffsetRadians = 1.57079632679f,
+    });
+}
+
+const CharacterDefinition* ContentDatabase::findCharacter(const std::string_view id) const {
+    const auto it = std::find_if(characters_.begin(), characters_.end(), [id](const CharacterDefinition& character) {
+        return character.id == id;
+    });
+    return it != characters_.end() ? &*it : nullptr;
+}
+
+const CharacterDefinition* ContentDatabase::defaultCharacter() const {
+    return characters_.empty() ? nullptr : &characters_.front();
 }
 
 }  // namespace mycsg::content

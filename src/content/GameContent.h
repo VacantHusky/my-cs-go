@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mycsg::content {
@@ -60,21 +61,33 @@ struct MaterialProfile {
     std::filesystem::path roughnessPath;
 };
 
+struct CharacterDefinition {
+    std::string id;
+    std::string displayName;
+    AssetBinding assets;
+    float modelScale = 1.0f;
+    float yawOffsetRadians = 0.0f;
+};
+
 class ContentDatabase {
 public:
     void bootstrap(const std::filesystem::path& assetRoot);
 
     const std::vector<WeaponDefinition>& weapons() const { return weapons_; }
     const std::vector<MaterialProfile>& materials() const { return materials_; }
+    const std::vector<CharacterDefinition>& characters() const { return characters_; }
+    const CharacterDefinition* findCharacter(std::string_view id) const;
+    const CharacterDefinition* defaultCharacter() const;
 
 private:
     void createPlaceholderAssets(const std::filesystem::path& assetRoot);
     void createMaterialProfiles(const std::filesystem::path& assetRoot);
     void createWeaponCatalog(const std::filesystem::path& assetRoot);
+    void createCharacterCatalog(const std::filesystem::path& assetRoot);
 
     std::vector<WeaponDefinition> weapons_;
     std::vector<MaterialProfile> materials_;
+    std::vector<CharacterDefinition> characters_;
 };
 
 }  // namespace mycsg::content
-

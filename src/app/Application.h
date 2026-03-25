@@ -2,16 +2,21 @@
 
 #include "app/MainMenu.h"
 #include "app/Settings.h"
+#include "audio/AudioSystem.h"
 #include "content/GameContent.h"
 #include "gameplay/MapData.h"
+#include "gameplay/PhysicsWorld.h"
 #include "gameplay/Simulation.h"
 #include "network/Network.h"
 #include "platform/Window.h"
 
 #include <filesystem>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mycsg::renderer {
@@ -27,11 +32,21 @@ enum class TrainingEquipmentSlot {
 };
 
 enum class MapEditorTool {
+    Select,
+    Place,
+    Erase,
+};
+
+enum class MapEditorPlacementKind {
     Wall,
-    Crate,
+    Prop,
     AttackerSpawn,
     DefenderSpawn,
-    Eraser,
+};
+
+enum class MapEditorViewMode {
+    Perspective,
+    OrthoTop,
 };
 
 class Application {
@@ -53,10 +68,20 @@ private:
     void activateSelectedSetting();
     void activateSelectedMenuItem();
     void activateMenuItem(std::size_t index);
-    void returnToMainMenu();
+    void returnToMainMenu(std::string_view statusOverride = {});
     void initializeSinglePlayerView();
+    void initializeMapEditorView();
     void updateSinglePlayerView(const platform::InputSnapshot& input, float deltaSeconds);
+    void updateMapEditorView(const platform::InputSnapshot& input, float deltaSeconds);
+    gameplay::PlayerState buildNetworkLocalPlayerState() const;
+    void syncLocalPlayerSimulationState();
+    void applyLatestNetworkMapState();
+    void applyLatestNetworkSnapshot();
+    void handleMovementFeedback(float baseSpread, float maxSpread);
+    void handlePendingDetonations();
     void syncInputMode();
+    bool isAuthoritativeGameplaySession() const;
+    bool isRemoteClientSession() const;
     bool collidesWithWorld(const util::Vec3& position) const;
     const content::WeaponDefinition* findWeaponDefinition(const std::string& id) const;
     void switchToNextTrainingWeapon();
@@ -72,6 +97,24 @@ private:
     void handleMultiplayerLobbyInput(const platform::InputSnapshot& input);
     void moveMapEditorCursor(int dx, int dz);
     bool selectMapEditorCellFromMouse(int mouseX, int mouseY);
+    void syncMapEditorTargetFromView();
+    std::optional<std::size_t> pickMapEditorPropFromView(float* outDistance = nullptr) const;
+    std::optional<std::size_t> pickMapEditorSpawnFromView(float* outDistance = nullptr) const;
+    bool pickMapEditorCellFromView(int& cellX, int& cellZ, float* outDistance = nullptr) const;
+    std::optional<std::size_t> findMapEditorPropIndexAtCell(int cellX, int cellZ) const;
+    void syncSelectedMapEditorPropFromCursor();
+    gameplay::MapProp* selectedMapEditorProp();
+    const gameplay::MapProp* selectedMapEditorProp() const;
+    void setSelectedMapEditorPropPosition(const util::Vec3& position);
+    void setSelectedMapEditorPropRotation(const util::Vec3& rotationDegrees);
+    void setSelectedMapEditorPropScale(const util::Vec3& scale);
+    bool buildMapEditorRay(util::Vec3& origin, util::Vec3& direction) const;
+    gameplay::MapProp buildMapEditorPlacementPreviewProp() const;
+    gameplay::SpawnPoint buildMapEditorPlacementPreviewSpawn() const;
+    void cycleMapEditorPlacementKind(int delta);
+    void pushMapEditorUndoSnapshot(const char* reason);
+    bool restoreMapEditorUndoSnapshot();
+    void clearMapEditorUndoHistory();
     void applyMapEditorTool();
     void eraseMapEditorCell();
     void openMapBrowser(AppFlow targetFlow);
@@ -88,10 +131,13 @@ private:
     std::filesystem::path nextCustomMapPath() const;
     void saveActiveMapArtifacts(const char* reason);
     const char* mapEditorToolLabel() const;
+    const char* mapEditorPlacementKindLabel() const;
+    const char* mapEditorViewModeLabel() const;
     void persistSettings(const char* reason);
     bool lineOfSightBlocked(const util::Vec3& from, const util::Vec3& to) const;
     void refreshWindowTitle();
     void logCurrentFlow() const;
+    void handleRendererUiActions();
     std::size_t hitTestMainMenuItem(int mouseX, int mouseY) const;
     std::size_t hitTestMapBrowserItem(int mouseX, int mouseY) const;
 
@@ -103,7 +149,9 @@ private:
     content::ContentDatabase contentDatabase_;
     gameplay::MapData activeMap_;
     gameplay::SimulationWorld simulation_;
+    gameplay::PhysicsWorld physicsWorld_;
     network::NetworkSession networkSession_;
+    audio::AudioSystem audioSystem_;
     std::unique_ptr<platform::IWindow> window_;
     std::unique_ptr<renderer::IRenderer> renderer_;
     AppFlow currentFlow_ = AppFlow::MainMenu;
@@ -116,8 +164,14 @@ private:
     util::Vec3 singlePlayerCameraPosition_{};
     float singlePlayerCameraYawRadians_ = 0.0f;
     float singlePlayerCameraPitchRadians_ = 0.0f;
-    float singlePlayerJumpOffset_ = 0.0f;
-    float singlePlayerVerticalVelocity_ = 0.0f;
+    util::Vec3 mapEditorCameraPosition_{};
+    float mapEditorCameraYawRadians_ = 0.0f;
+    float mapEditorCameraPitchRadians_ = 0.0f;
+    util::Vec3 mapEditorTargetPosition_{};
+    util::Vec3 mapEditorTargetNormal_{0.0f, 1.0f, 0.0f};
+    bool mapEditorHasTarget_ = false;
+    bool mapEditorTargetOnSurface_ = false;
+    bool mapEditorMouseLookActive_ = false;
     std::string activeWeaponLabel_ = "AK-12";
     std::vector<std::string> trainingWeaponIds_;
     std::size_t activeTrainingWeaponIndex_ = 0;
@@ -139,12 +193,26 @@ private:
     int fragCount_ = 2;
     int flashCount_ = 2;
     int smokeCount_ = 2;
-    MapEditorTool mapEditorTool_ = MapEditorTool::Wall;
+    MapEditorTool mapEditorTool_ = MapEditorTool::Select;
+    MapEditorPlacementKind mapEditorPlacementKind_ = MapEditorPlacementKind::Prop;
+    MapEditorViewMode mapEditorViewMode_ = MapEditorViewMode::Perspective;
+    std::size_t editorWallMaterialIndex_ = 0;
+    std::size_t editorPropPresetIndex_ = 0;
+    float editorPropRotationDegrees_ = 0.0f;
+    std::size_t editorPropScalePresetIndex_ = 1;
+    float mapEditorOrthoSpan_ = 14.0f;
     int mapEditorCursorX_ = 3;
     int mapEditorCursorZ_ = 3;
+    std::optional<std::size_t> hoveredEditorPropIndex_;
+    std::optional<std::size_t> hoveredEditorSpawnIndex_;
+    std::optional<std::size_t> selectedEditorPropIndex_;
+    std::vector<gameplay::MapData> mapEditorUndoStack_;
     std::string mapEditorStatus_ = "可编辑";
     network::SessionType multiplayerSessionType_ = network::SessionType::Host;
     bool multiplayerSessionActive_ = false;
+    bool multiplayerGameplayReady_ = true;
+    bool receivedMultiplayerSnapshot_ = false;
+    std::uint64_t appliedNetworkMapRevision_ = 0;
     std::string multiplayerStatus_ = "尚未启动房间";
     std::vector<std::filesystem::path> mapCatalogPaths_;
     std::size_t activeMapCatalogIndex_ = 0;

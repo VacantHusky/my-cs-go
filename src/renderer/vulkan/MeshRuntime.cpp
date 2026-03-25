@@ -4,8 +4,10 @@
 
 #include <spdlog/spdlog.h>
 
-#define CGLTF_IMPLEMENTATION
-#include <cgltf.h>
+#include <fastgltf/core.hpp>
+#include <fastgltf/tools.hpp>
+
+#include <stb_image.h>
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include <tiny_obj_loader.h>
@@ -16,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -125,23 +128,23 @@ void appendVertex(CpuMesh& mesh,
     });
 }
 
-void appendTriangle(CpuMesh& mesh,
-                    const util::Vec3 a,
-                    const util::Vec3 b,
-                    const util::Vec3 c,
-                    const util::Vec3 color) {
+[[maybe_unused]] void appendTriangle(CpuMesh& mesh,
+                                     const util::Vec3 a,
+                                     const util::Vec3 b,
+                                     const util::Vec3 c,
+                                     const util::Vec3 color) {
     const util::Vec3 normal = normalize(cross(subtract(b, a), subtract(c, a)));
     appendVertex(mesh, a, normal, {0.0f, 0.0f}, color);
     appendVertex(mesh, b, normal, {1.0f, 0.0f}, color);
     appendVertex(mesh, c, normal, {1.0f, 1.0f}, color);
 }
 
-void appendQuad(CpuMesh& mesh,
-                const util::Vec3 a,
-                const util::Vec3 b,
-                const util::Vec3 c,
-                const util::Vec3 d,
-                const util::Vec3 color) {
+[[maybe_unused]] void appendQuad(CpuMesh& mesh,
+                                 const util::Vec3 a,
+                                 const util::Vec3 b,
+                                 const util::Vec3 c,
+                                 const util::Vec3 d,
+                                 const util::Vec3 color) {
     appendTriangle(mesh, a, b, c, color);
     appendTriangle(mesh, a, c, d, color);
 }
@@ -176,7 +179,7 @@ util::Vec3 pathColor(const std::filesystem::path& sourcePath, const std::string&
     return {0.78f, 0.80f, 0.84f};
 }
 
-util::Vec3 blockColorForMaterial(const std::string& materialId, const bool shadedSide) {
+[[maybe_unused]] util::Vec3 blockColorForMaterial(const std::string& materialId, const bool shadedSide) {
     if (materialId.find("bomb_site_a") != std::string::npos) {
         return shadedSide ? util::Vec3{0.62f, 0.28f, 0.22f} : util::Vec3{0.78f, 0.34f, 0.28f};
     }
@@ -217,20 +220,24 @@ void finalizeMeshBounds(CpuMesh& mesh) {
     mesh.valid = true;
 }
 
-util::Vec3 transformPosition(const float matrix[16], const util::Vec3 position) {
-    return {
-        matrix[0] * position.x + matrix[4] * position.y + matrix[8] * position.z + matrix[12],
-        matrix[1] * position.x + matrix[5] * position.y + matrix[9] * position.z + matrix[13],
-        matrix[2] * position.x + matrix[6] * position.y + matrix[10] * position.z + matrix[14],
-    };
+util::Vec3 transformPosition(const fastgltf::math::fmat4x4& matrix,
+                             const fastgltf::math::fvec3 position) {
+    const fastgltf::math::fvec4 transformed = matrix * fastgltf::math::fvec4(
+        position.x(),
+        position.y(),
+        position.z(),
+        1.0f);
+    return {transformed.x(), transformed.y(), transformed.z()};
 }
 
-util::Vec3 transformDirection(const float matrix[16], const util::Vec3 direction) {
-    return normalize({
-        matrix[0] * direction.x + matrix[4] * direction.y + matrix[8] * direction.z,
-        matrix[1] * direction.x + matrix[5] * direction.y + matrix[9] * direction.z,
-        matrix[2] * direction.x + matrix[6] * direction.y + matrix[10] * direction.z,
-    });
+util::Vec3 transformDirection(const fastgltf::math::fmat4x4& matrix,
+                              const fastgltf::math::fvec3 direction) {
+    const fastgltf::math::fvec4 transformed = matrix * fastgltf::math::fvec4(
+        direction.x(),
+        direction.y(),
+        direction.z(),
+        0.0f);
+    return normalize({transformed.x(), transformed.y(), transformed.z()});
 }
 
 util::Vec2 readTexcoord(const tinyobj::attrib_t& attrib, const int texcoordIndex) {
@@ -358,94 +365,315 @@ CpuMesh loadObjSource(const std::filesystem::path& sourcePath) {
     return mesh;
 }
 
-const cgltf_accessor* findPrimitiveAccessor(const cgltf_primitive& primitive, const cgltf_attribute_type type) {
-    for (cgltf_size index = 0; index < primitive.attributes_count; ++index) {
-        if (primitive.attributes[index].type == type) {
-            return primitive.attributes[index].data;
-        }
+const fastgltf::Accessor* findPrimitiveAccessor(const fastgltf::Asset& asset,
+                                                const fastgltf::Primitive& primitive,
+                                                const std::string_view attributeName) {
+    const auto accessorIt = primitive.findAttribute(attributeName);
+    if (accessorIt == primitive.attributes.cend()) {
+        return nullptr;
     }
-    return nullptr;
+    if (accessorIt->accessorIndex >= asset.accessors.size()) {
+        return nullptr;
+    }
+    return &asset.accessors[accessorIt->accessorIndex];
 }
 
-util::Vec3 gltfMaterialColor(const std::filesystem::path& sourcePath, const cgltf_material* material) {
-    if (material != nullptr && material->has_pbr_metallic_roughness) {
-        const auto& factor = material->pbr_metallic_roughness.base_color_factor;
-        if (factor[0] > 0.001f || factor[1] > 0.001f || factor[2] > 0.001f) {
+util::Vec3 gltfMaterialColor(const std::filesystem::path& sourcePath,
+                             const fastgltf::Asset& asset,
+                             const fastgltf::Primitive& primitive) {
+    if (primitive.materialIndex && *primitive.materialIndex < asset.materials.size()) {
+        const auto& material = asset.materials[*primitive.materialIndex];
+        const auto& factor = material.pbrData.baseColorFactor;
+        const bool isDefaultWhite =
+            std::abs(factor.x() - 1.0f) <= 0.01f &&
+            std::abs(factor.y() - 1.0f) <= 0.01f &&
+            std::abs(factor.z() - 1.0f) <= 0.01f;
+        if (!isDefaultWhite && (factor.x() > 0.001f || factor.y() > 0.001f || factor.z() > 0.001f)) {
             return {
-                std::clamp(factor[0], 0.0f, 1.0f),
-                std::clamp(factor[1], 0.0f, 1.0f),
-                std::clamp(factor[2], 0.0f, 1.0f),
+                std::clamp(factor.x(), 0.0f, 1.0f),
+                std::clamp(factor.y(), 0.0f, 1.0f),
+                std::clamp(factor.z(), 0.0f, 1.0f),
             };
         }
+        return pathColor(sourcePath, std::string(material.name));
     }
-    return pathColor(sourcePath, material != nullptr && material->name != nullptr ? material->name : "");
+    return pathColor(sourcePath);
 }
 
-util::Vec3 readAccessorVec3(const cgltf_accessor* accessor, const cgltf_size index) {
-    float values[4]{};
-    if (accessor == nullptr || !cgltf_accessor_read_float(accessor, index, values, 3)) {
-        return {};
-    }
-    return {values[0], values[1], values[2]};
+struct DecodedGltfImage {
+    std::vector<unsigned char> rgba;
+    int width = 0;
+    int height = 0;
+    bool attempted = false;
+    bool valid = false;
+};
+
+struct PrimitiveColorSource {
+    util::Vec3 fallbackColor{1.0f, 1.0f, 1.0f};
+    util::Vec3 factor{1.0f, 1.0f, 1.0f};
+    const DecodedGltfImage* image = nullptr;
+    std::size_t texCoordSet = 0;
+    fastgltf::Wrap wrapS = fastgltf::Wrap::Repeat;
+    fastgltf::Wrap wrapT = fastgltf::Wrap::Repeat;
+};
+
+std::vector<std::byte> copyBytes(const std::span<const std::byte> bytes) {
+    return {bytes.begin(), bytes.end()};
 }
 
-util::Vec2 readAccessorVec2(const cgltf_accessor* accessor, const cgltf_size index) {
-    float values[4]{};
-    if (accessor == nullptr || !cgltf_accessor_read_float(accessor, index, values, 2)) {
-        return {};
+std::vector<std::byte> loadGltfImageBytes(const fastgltf::Asset& asset,
+                                          const fastgltf::Image& image,
+                                          const std::filesystem::path& sourcePath) {
+    if (const auto* bufferViewSource = std::get_if<fastgltf::sources::BufferView>(&image.data)) {
+        const fastgltf::DefaultBufferDataAdapter adapter;
+        return copyBytes(adapter(asset, bufferViewSource->bufferViewIndex));
     }
-    return {values[0], 1.0f - values[1]};
+    if (const auto* arraySource = std::get_if<fastgltf::sources::Array>(&image.data)) {
+        return copyBytes(std::span<const std::byte>(arraySource->bytes.data(), arraySource->bytes.size()));
+    }
+    if (const auto* vectorSource = std::get_if<fastgltf::sources::Vector>(&image.data)) {
+        return {vectorSource->bytes.begin(), vectorSource->bytes.end()};
+    }
+    if (const auto* byteViewSource = std::get_if<fastgltf::sources::ByteView>(&image.data)) {
+        return copyBytes(byteViewSource->bytes);
+    }
+    if (const auto* uriSource = std::get_if<fastgltf::sources::URI>(&image.data)) {
+        if (uriSource->uri.isLocalPath()) {
+            return util::FileSystem::readBinary((sourcePath.parent_path() / uriSource->uri.fspath()).lexically_normal());
+        }
+    }
+    return {};
+}
+
+const DecodedGltfImage* ensureDecodedGltfImage(std::vector<DecodedGltfImage>& cache,
+                                               const fastgltf::Asset& asset,
+                                               const std::filesystem::path& sourcePath,
+                                               const std::size_t imageIndex) {
+    if (imageIndex >= asset.images.size()) {
+        return nullptr;
+    }
+
+    DecodedGltfImage& decoded = cache[imageIndex];
+    if (!decoded.attempted) {
+        decoded.attempted = true;
+        const std::vector<std::byte> bytes = loadGltfImageBytes(asset, asset.images[imageIndex], sourcePath);
+        if (!bytes.empty()) {
+            int width = 0;
+            int height = 0;
+            int channels = 0;
+            unsigned char* pixels = stbi_load_from_memory(
+                reinterpret_cast<const stbi_uc*>(bytes.data()),
+                static_cast<int>(bytes.size()),
+                &width,
+                &height,
+                &channels,
+                STBI_rgb_alpha);
+            if (pixels != nullptr && width > 0 && height > 0) {
+                decoded.width = width;
+                decoded.height = height;
+                decoded.rgba.assign(pixels, pixels + static_cast<std::size_t>(width * height * 4));
+                decoded.valid = true;
+            }
+            stbi_image_free(pixels);
+        }
+    }
+
+    return decoded.valid ? &decoded : nullptr;
+}
+
+float wrapUv(const float uv, const fastgltf::Wrap wrapMode) {
+    switch (wrapMode) {
+        case fastgltf::Wrap::ClampToEdge:
+            return std::clamp(uv, 0.0f, 1.0f);
+        case fastgltf::Wrap::MirroredRepeat: {
+            float wrapped = std::fmod(uv, 2.0f);
+            if (wrapped < 0.0f) {
+                wrapped += 2.0f;
+            }
+            return wrapped <= 1.0f ? wrapped : (2.0f - wrapped);
+        }
+        case fastgltf::Wrap::Repeat:
+        default: {
+            float wrapped = std::fmod(uv, 1.0f);
+            if (wrapped < 0.0f) {
+                wrapped += 1.0f;
+            }
+            return wrapped;
+        }
+    }
+}
+
+util::Vec3 sampleDecodedGltfImage(const DecodedGltfImage& image,
+                                  const util::Vec2 uv,
+                                  const fastgltf::Wrap wrapS,
+                                  const fastgltf::Wrap wrapT) {
+    if (!image.valid || image.width <= 0 || image.height <= 0) {
+        return {1.0f, 1.0f, 1.0f};
+    }
+
+    const float u = wrapUv(uv.x, wrapS);
+    const float v = wrapUv(uv.y, wrapT);
+    const int pixelX = std::clamp(static_cast<int>(std::round(u * static_cast<float>(image.width - 1))), 0, image.width - 1);
+    const int pixelY = std::clamp(static_cast<int>(std::round(v * static_cast<float>(image.height - 1))), 0, image.height - 1);
+    const std::size_t index = static_cast<std::size_t>((pixelY * image.width + pixelX) * 4);
+    if (index + 2 >= image.rgba.size()) {
+        return {1.0f, 1.0f, 1.0f};
+    }
+
+    return {
+        static_cast<float>(image.rgba[index + 0]) / 255.0f,
+        static_cast<float>(image.rgba[index + 1]) / 255.0f,
+        static_cast<float>(image.rgba[index + 2]) / 255.0f,
+    };
+}
+
+const fastgltf::Accessor* findTexcoordAccessor(const fastgltf::Asset& asset,
+                                               const fastgltf::Primitive& primitive,
+                                               const std::size_t texCoordSet) {
+    const std::string attributeName = "TEXCOORD_" + std::to_string(texCoordSet);
+    return findPrimitiveAccessor(asset, primitive, attributeName);
+}
+
+PrimitiveColorSource buildPrimitiveColorSource(const std::filesystem::path& sourcePath,
+                                               const fastgltf::Asset& asset,
+                                               const fastgltf::Primitive& primitive,
+                                               std::vector<DecodedGltfImage>& imageCache) {
+    PrimitiveColorSource source{};
+    source.fallbackColor = gltfMaterialColor(sourcePath, asset, primitive);
+
+    if (!primitive.materialIndex || *primitive.materialIndex >= asset.materials.size()) {
+        return source;
+    }
+
+    const auto& material = asset.materials[*primitive.materialIndex];
+    const auto& factor = material.pbrData.baseColorFactor;
+    source.factor = {
+        std::clamp(factor.x(), 0.0f, 1.0f),
+        std::clamp(factor.y(), 0.0f, 1.0f),
+        std::clamp(factor.z(), 0.0f, 1.0f),
+    };
+
+    if (!material.pbrData.baseColorTexture) {
+        return source;
+    }
+
+    const std::size_t textureIndex = material.pbrData.baseColorTexture->textureIndex;
+    if (textureIndex >= asset.textures.size()) {
+        return source;
+    }
+
+    source.texCoordSet = material.pbrData.baseColorTexture->texCoordIndex;
+    const auto& texture = asset.textures[textureIndex];
+    if (texture.samplerIndex && *texture.samplerIndex < asset.samplers.size()) {
+        const auto& sampler = asset.samplers[*texture.samplerIndex];
+        source.wrapS = sampler.wrapS;
+        source.wrapT = sampler.wrapT;
+    }
+
+    if (!texture.imageIndex || *texture.imageIndex >= asset.images.size()) {
+        return source;
+    }
+
+    source.image = ensureDecodedGltfImage(imageCache, asset, sourcePath, *texture.imageIndex);
+    return source;
 }
 
 void appendGltfPrimitive(CpuMesh& mesh,
                          const std::filesystem::path& sourcePath,
-                         const cgltf_node* node,
-                         const cgltf_primitive& primitive) {
-    if (primitive.type != cgltf_primitive_type_triangles) {
+                         const fastgltf::Asset& asset,
+                         std::vector<DecodedGltfImage>& imageCache,
+                         const fastgltf::math::fmat4x4& transform,
+                         const fastgltf::Primitive& primitive) {
+    if (primitive.type != fastgltf::PrimitiveType::Triangles) {
         return;
     }
 
-    const cgltf_accessor* positionAccessor = findPrimitiveAccessor(primitive, cgltf_attribute_type_position);
-    if (positionAccessor == nullptr) {
+    const fastgltf::Accessor* positionAccessor = findPrimitiveAccessor(asset, primitive, "POSITION");
+    if (positionAccessor == nullptr || positionAccessor->type != fastgltf::AccessorType::Vec3) {
         return;
     }
 
-    const cgltf_accessor* normalAccessor = findPrimitiveAccessor(primitive, cgltf_attribute_type_normal);
-    const cgltf_accessor* texcoordAccessor = findPrimitiveAccessor(primitive, cgltf_attribute_type_texcoord);
-    const util::Vec3 color = gltfMaterialColor(sourcePath, primitive.material);
-    float matrix[16]{};
-    cgltf_node_transform_world(node, matrix);
+    const fastgltf::Accessor* normalAccessor = findPrimitiveAccessor(asset, primitive, "NORMAL");
+    const PrimitiveColorSource colorSource = buildPrimitiveColorSource(sourcePath, asset, primitive, imageCache);
+    const fastgltf::Accessor* texcoordAccessor = findTexcoordAccessor(asset, primitive, colorSource.texCoordSet);
 
-    const cgltf_size indexCount = primitive.indices != nullptr ? primitive.indices->count : positionAccessor->count;
-    for (cgltf_size index = 0; index + 2 < indexCount; index += 3) {
-        const std::array<cgltf_size, 3> triangleIndices{
-            primitive.indices != nullptr ? cgltf_accessor_read_index(primitive.indices, index) : index,
-            primitive.indices != nullptr ? cgltf_accessor_read_index(primitive.indices, index + 1) : index + 1,
-            primitive.indices != nullptr ? cgltf_accessor_read_index(primitive.indices, index + 2) : index + 2,
+    const std::size_t vertexCount = positionAccessor->count;
+    if (vertexCount == 0) {
+        return;
+    }
+
+    std::vector<util::Vec3> positions(vertexCount);
+    fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, *positionAccessor,
+        [&](const fastgltf::math::fvec3 value, const std::size_t index) {
+            if (index < positions.size()) {
+                positions[index] = transformPosition(transform, value);
+            }
+        });
+
+    std::vector<util::Vec3> normals(vertexCount);
+    bool hasNormals = normalAccessor != nullptr && normalAccessor->type == fastgltf::AccessorType::Vec3;
+    if (hasNormals) {
+        fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, *normalAccessor,
+            [&](const fastgltf::math::fvec3 value, const std::size_t index) {
+                if (index < normals.size()) {
+                    normals[index] = transformDirection(transform, value);
+                }
+            });
+    }
+
+    std::vector<util::Vec2> texcoords(vertexCount);
+    const bool hasTexcoords = texcoordAccessor != nullptr && texcoordAccessor->type == fastgltf::AccessorType::Vec2;
+    if (hasTexcoords) {
+        fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(asset, *texcoordAccessor,
+            [&](const fastgltf::math::fvec2 value, const std::size_t index) {
+                if (index < texcoords.size()) {
+                    texcoords[index] = {value.x(), 1.0f - value.y()};
+                }
+            });
+    }
+
+    std::vector<std::uint32_t> indices;
+    if (primitive.indicesAccessor && *primitive.indicesAccessor < asset.accessors.size()) {
+        const fastgltf::Accessor& indexAccessor = asset.accessors[*primitive.indicesAccessor];
+        if (indexAccessor.type != fastgltf::AccessorType::Scalar || indexAccessor.count < 3) {
+            return;
+        }
+        indices.resize(indexAccessor.count);
+        fastgltf::copyFromAccessor<std::uint32_t>(asset, indexAccessor, indices.data());
+    } else {
+        indices.resize(vertexCount);
+        for (std::size_t index = 0; index < vertexCount; ++index) {
+            indices[index] = static_cast<std::uint32_t>(index);
+        }
+    }
+
+    for (std::size_t index = 0; index + 2 < indices.size(); index += 3) {
+        const std::array<std::size_t, 3> triangleIndices{
+            static_cast<std::size_t>(indices[index]),
+            static_cast<std::size_t>(indices[index + 1]),
+            static_cast<std::size_t>(indices[index + 2]),
         };
 
-        if (triangleIndices[0] >= positionAccessor->count ||
-            triangleIndices[1] >= positionAccessor->count ||
-            triangleIndices[2] >= positionAccessor->count) {
+        if (triangleIndices[0] >= positions.size() ||
+            triangleIndices[1] >= positions.size() ||
+            triangleIndices[2] >= positions.size()) {
             continue;
         }
 
-        std::array<util::Vec3, 3> positions{};
-        std::array<util::Vec3, 3> normals{};
-        std::array<util::Vec2, 3> texcoords{};
-        bool needsFallbackNormal = normalAccessor == nullptr;
+        std::array<util::Vec3, 3> trianglePositions{};
+        std::array<util::Vec3, 3> triangleNormals{};
+        std::array<util::Vec2, 3> triangleTexcoords{};
+        bool needsFallbackNormal = !hasNormals;
 
         for (std::size_t vertex = 0; vertex < 3; ++vertex) {
-            positions[vertex] = transformPosition(matrix, readAccessorVec3(positionAccessor, triangleIndices[vertex]));
-            normals[vertex] = normalAccessor != nullptr
-                ? transformDirection(matrix, readAccessorVec3(normalAccessor, triangleIndices[vertex]))
-                : util::Vec3{};
-            texcoords[vertex] = readAccessorVec2(texcoordAccessor, triangleIndices[vertex]);
-            if (normalAccessor != nullptr) {
+            trianglePositions[vertex] = positions[triangleIndices[vertex]];
+            triangleNormals[vertex] = hasNormals ? normals[triangleIndices[vertex]] : util::Vec3{};
+            triangleTexcoords[vertex] = hasTexcoords ? texcoords[triangleIndices[vertex]] : util::Vec2{};
+            if (hasNormals) {
                 const float lengthSquared =
-                    normals[vertex].x * normals[vertex].x +
-                    normals[vertex].y * normals[vertex].y +
-                    normals[vertex].z * normals[vertex].z;
+                    triangleNormals[vertex].x * triangleNormals[vertex].x +
+                    triangleNormals[vertex].y * triangleNormals[vertex].y +
+                    triangleNormals[vertex].z * triangleNormals[vertex].z;
                 if (lengthSquared <= 0.0001f) {
                     needsFallbackNormal = true;
                 }
@@ -453,62 +681,84 @@ void appendGltfPrimitive(CpuMesh& mesh,
         }
 
         const util::Vec3 fallbackNormal = normalize(cross(
-            subtract(positions[1], positions[0]),
-            subtract(positions[2], positions[0])));
+            subtract(trianglePositions[1], trianglePositions[0]),
+            subtract(trianglePositions[2], trianglePositions[0])));
 
         for (std::size_t vertex = 0; vertex < 3; ++vertex) {
-            appendVertex(mesh, positions[vertex], needsFallbackNormal ? fallbackNormal : normals[vertex], texcoords[vertex], color);
+            util::Vec3 color = colorSource.fallbackColor;
+            if (colorSource.image != nullptr && hasTexcoords) {
+                const util::Vec3 albedo = sampleDecodedGltfImage(*colorSource.image,
+                                                                 triangleTexcoords[vertex],
+                                                                 colorSource.wrapS,
+                                                                 colorSource.wrapT);
+                color = {
+                    std::clamp(albedo.x * colorSource.factor.x, 0.0f, 1.0f),
+                    std::clamp(albedo.y * colorSource.factor.y, 0.0f, 1.0f),
+                    std::clamp(albedo.z * colorSource.factor.z, 0.0f, 1.0f),
+                };
+            }
+            appendVertex(mesh,
+                         trianglePositions[vertex],
+                         needsFallbackNormal ? fallbackNormal : triangleNormals[vertex],
+                         triangleTexcoords[vertex],
+                         color);
         }
-    }
-}
-
-void appendGltfNode(CpuMesh& mesh,
-                    const std::filesystem::path& sourcePath,
-                    const cgltf_node* node) {
-    if (node->mesh != nullptr) {
-        for (cgltf_size primitiveIndex = 0; primitiveIndex < node->mesh->primitives_count; ++primitiveIndex) {
-            appendGltfPrimitive(mesh, sourcePath, node, node->mesh->primitives[primitiveIndex]);
-        }
-    }
-
-    for (cgltf_size childIndex = 0; childIndex < node->children_count; ++childIndex) {
-        appendGltfNode(mesh, sourcePath, node->children[childIndex]);
     }
 }
 
 CpuMesh loadGltfSource(const std::filesystem::path& sourcePath) {
     CpuMesh mesh;
 
-    cgltf_options options{};
-    cgltf_data* data = nullptr;
-    const std::string filename = sourcePath.string();
-
-    const cgltf_result parseResult = cgltf_parse_file(&options, filename.c_str(), &data);
-    if (parseResult != cgltf_result_success || data == nullptr) {
-        spdlog::warn("[MeshRuntime] Failed to parse glTF {} (code={}).", sourcePath.generic_string(), static_cast<int>(parseResult));
+    auto buffer = fastgltf::GltfDataBuffer::FromPath(sourcePath);
+    if (buffer.error() != fastgltf::Error::None) {
+        spdlog::warn("[MeshRuntime] Failed to open glTF {} ({}: {}).",
+                     sourcePath.generic_string(),
+                     fastgltf::getErrorName(buffer.error()),
+                     fastgltf::getErrorMessage(buffer.error()));
         return mesh;
     }
 
-    const cgltf_result bufferResult = cgltf_load_buffers(&options, data, filename.c_str());
-    if (bufferResult != cgltf_result_success) {
-        spdlog::warn("[MeshRuntime] Failed to load glTF buffers {} (code={}).", sourcePath.generic_string(), static_cast<int>(bufferResult));
-        cgltf_free(data);
+    fastgltf::Parser parser(fastgltf::Extensions::KHR_mesh_quantization);
+    constexpr fastgltf::Options kLoadOptions =
+        fastgltf::Options::DontRequireValidAssetMember |
+        fastgltf::Options::AllowDouble |
+        fastgltf::Options::LoadExternalBuffers |
+        fastgltf::Options::LoadExternalImages |
+        fastgltf::Options::GenerateMeshIndices;
+
+    auto assetResult = parser.loadGltf(buffer.get(), sourcePath.parent_path(), kLoadOptions);
+    if (assetResult.error() != fastgltf::Error::None) {
+        spdlog::warn("[MeshRuntime] Failed to parse glTF {} ({}: {}).",
+                     sourcePath.generic_string(),
+                     fastgltf::getErrorName(assetResult.error()),
+                     fastgltf::getErrorMessage(assetResult.error()));
         return mesh;
     }
 
-    const cgltf_scene* scene = data->scene != nullptr
-        ? data->scene
-        : (data->scenes_count > 0 ? &data->scenes[0] : nullptr);
-    if (scene == nullptr) {
-        cgltf_free(data);
+    fastgltf::Asset& asset = assetResult.get();
+    if (asset.scenes.empty()) {
+        spdlog::warn("[MeshRuntime] glTF scene list is empty: {}", sourcePath.generic_string());
         return mesh;
     }
 
-    for (cgltf_size nodeIndex = 0; nodeIndex < scene->nodes_count; ++nodeIndex) {
-        appendGltfNode(mesh, sourcePath, scene->nodes[nodeIndex]);
+    std::size_t sceneIndex = asset.defaultScene.value_or(0);
+    if (sceneIndex >= asset.scenes.size()) {
+        sceneIndex = 0;
     }
 
-    cgltf_free(data);
+    std::vector<DecodedGltfImage> imageCache(asset.images.size());
+    fastgltf::iterateSceneNodes(asset, sceneIndex, fastgltf::math::fmat4x4(),
+        [&](fastgltf::Node& node, const fastgltf::math::fmat4x4& transform) {
+            if (!node.meshIndex || *node.meshIndex >= asset.meshes.size()) {
+                return;
+            }
+
+            const fastgltf::Mesh& gltfMesh = asset.meshes[*node.meshIndex];
+            for (const auto& primitive : gltfMesh.primitives) {
+                appendGltfPrimitive(mesh, sourcePath, asset, imageCache, transform, primitive);
+            }
+        });
+
     finalizeMeshBounds(mesh);
     return mesh;
 }
@@ -570,7 +820,7 @@ CpuMesh loadMeshFromSource(const std::filesystem::path& sourcePath) {
     if (extension == ".obj") {
         return loadObjSource(sourcePath);
     }
-    if (extension == ".gltf") {
+    if (extension == ".gltf" || extension == ".glb") {
         return loadGltfSource(sourcePath);
     }
     return {};
@@ -592,91 +842,8 @@ CpuMesh loadMeshAsset(const std::filesystem::path& assetRoot,
 }
 
 CpuMesh buildStaticWorldMesh(const gameplay::MapData& map) {
-    CpuMesh mesh;
-
-    for (int z = 0; z < map.depth; ++z) {
-        for (int x = 0; x < map.width; ++x) {
-            std::string floorMaterial = "floor_concrete";
-            int wallHeight = 0;
-            bool hasRamp = false;
-            gameplay::RampDirection rampDirection = gameplay::RampDirection::North;
-
-            for (const auto& block : map.blocks) {
-                if (block.cell.x != x || block.cell.z != z) {
-                    continue;
-                }
-                if (block.cell.y == 0) {
-                    floorMaterial = block.materialId;
-                }
-                if (block.solid && block.cell.y >= 1) {
-                    wallHeight = std::max(wallHeight, block.cell.y + 1);
-                }
-                if (gameplay::isRampMaterial(block.materialId)) {
-                    hasRamp = true;
-                    if (block.materialId.rfind("ramp_north", 0) == 0) rampDirection = gameplay::RampDirection::North;
-                    else if (block.materialId.rfind("ramp_south", 0) == 0) rampDirection = gameplay::RampDirection::South;
-                    else if (block.materialId.rfind("ramp_east", 0) == 0) rampDirection = gameplay::RampDirection::East;
-                    else if (block.materialId.rfind("ramp_west", 0) == 0) rampDirection = gameplay::RampDirection::West;
-                    floorMaterial = block.materialId;
-                }
-            }
-
-            const util::Vec3 floorColor = blockColorForMaterial(floorMaterial, false);
-            appendQuad(mesh,
-                {static_cast<float>(x), 0.0f, static_cast<float>(z)},
-                {static_cast<float>(x), 0.0f, static_cast<float>(z + 1)},
-                {static_cast<float>(x + 1), 0.0f, static_cast<float>(z + 1)},
-                {static_cast<float>(x + 1), 0.0f, static_cast<float>(z)},
-                floorColor);
-
-            if (hasRamp) {
-                const util::Vec3 rampTop = blockColorForMaterial(floorMaterial, false);
-                const util::Vec3 rampSide = blockColorForMaterial(floorMaterial, true);
-                const float baseX = static_cast<float>(x);
-                const float baseZ = static_cast<float>(z);
-                const float low = 0.0f;
-                const float high = 1.0f;
-                if (rampDirection == gameplay::RampDirection::East) {
-                    appendQuad(mesh, {baseX, low, baseZ}, {baseX, low, baseZ + 1.0f}, {baseX + 1.0f, high, baseZ + 1.0f}, {baseX + 1.0f, high, baseZ}, rampTop);
-                    appendTriangle(mesh, {baseX, low, baseZ}, {baseX, low, baseZ + 1.0f}, {baseX, high, baseZ + 1.0f}, rampSide);
-                    appendTriangle(mesh, {baseX, low, baseZ}, {baseX, high, baseZ + 1.0f}, {baseX, high, baseZ}, rampSide);
-                } else if (rampDirection == gameplay::RampDirection::West) {
-                    appendQuad(mesh, {baseX, high, baseZ}, {baseX, high, baseZ + 1.0f}, {baseX + 1.0f, low, baseZ + 1.0f}, {baseX + 1.0f, low, baseZ}, rampTop);
-                    appendTriangle(mesh, {baseX + 1.0f, low, baseZ}, {baseX + 1.0f, high, baseZ}, {baseX + 1.0f, high, baseZ + 1.0f}, rampSide);
-                    appendTriangle(mesh, {baseX + 1.0f, low, baseZ}, {baseX + 1.0f, high, baseZ + 1.0f}, {baseX + 1.0f, low, baseZ + 1.0f}, rampSide);
-                } else if (rampDirection == gameplay::RampDirection::South) {
-                    appendQuad(mesh, {baseX, low, baseZ}, {baseX, high, baseZ + 1.0f}, {baseX + 1.0f, high, baseZ + 1.0f}, {baseX + 1.0f, low, baseZ}, rampTop);
-                    appendTriangle(mesh, {baseX, low, baseZ + 1.0f}, {baseX + 1.0f, low, baseZ + 1.0f}, {baseX + 1.0f, high, baseZ + 1.0f}, rampSide);
-                    appendTriangle(mesh, {baseX, low, baseZ + 1.0f}, {baseX + 1.0f, high, baseZ + 1.0f}, {baseX, high, baseZ + 1.0f}, rampSide);
-                } else {
-                    appendQuad(mesh, {baseX, high, baseZ}, {baseX, low, baseZ + 1.0f}, {baseX + 1.0f, low, baseZ + 1.0f}, {baseX + 1.0f, high, baseZ}, rampTop);
-                    appendTriangle(mesh, {baseX, low, baseZ}, {baseX + 1.0f, high, baseZ}, {baseX + 1.0f, low, baseZ}, rampSide);
-                    appendTriangle(mesh, {baseX, low, baseZ}, {baseX, high, baseZ}, {baseX + 1.0f, high, baseZ}, rampSide);
-                }
-            }
-
-            if (wallHeight <= 0) {
-                continue;
-            }
-
-            const util::Vec3 topColor = blockColorForMaterial(floorMaterial, false);
-            const util::Vec3 sideColor = blockColorForMaterial(floorMaterial, true);
-            const float left = static_cast<float>(x);
-            const float right = static_cast<float>(x + 1);
-            const float front = static_cast<float>(z);
-            const float back = static_cast<float>(z + 1);
-            const float top = static_cast<float>(wallHeight);
-
-            appendQuad(mesh, {left, top, front}, {left, top, back}, {right, top, back}, {right, top, front}, topColor);
-            appendQuad(mesh, {left, 0.0f, front}, {left, top, front}, {right, top, front}, {right, 0.0f, front}, sideColor);
-            appendQuad(mesh, {right, 0.0f, front}, {right, top, front}, {right, top, back}, {right, 0.0f, back}, sideColor);
-            appendQuad(mesh, {left, 0.0f, front}, {left, 0.0f, back}, {left, top, back}, {left, top, front}, sideColor);
-            appendQuad(mesh, {left, 0.0f, back}, {right, 0.0f, back}, {right, top, back}, {left, top, back}, sideColor);
-        }
-    }
-
-    finalizeMeshBounds(mesh);
-    return mesh;
+    (void)map;
+    return {};
 }
 
 }  // namespace mycsg::renderer::vulkan

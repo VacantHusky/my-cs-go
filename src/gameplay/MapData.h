@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mycsg::gameplay {
@@ -13,25 +14,6 @@ enum class Team {
     Neutral,
     Attackers,
     Defenders
-};
-
-enum class RampDirection {
-    North,
-    South,
-    East,
-    West
-};
-
-struct Int3 {
-    int x = 0;
-    int y = 0;
-    int z = 0;
-};
-
-struct MapBlock {
-    Int3 cell;
-    std::string materialId;
-    bool solid = true;
 };
 
 struct SpawnPoint {
@@ -44,6 +26,8 @@ struct MapProp {
     util::Vec3 position;
     std::filesystem::path modelPath;
     std::filesystem::path materialPath;
+    util::Vec3 rotationDegrees{};
+    util::Vec3 scale{1.0f, 1.0f, 1.0f};
 };
 
 struct LightProbe {
@@ -57,7 +41,6 @@ struct MapData {
     int width = 24;
     int height = 8;
     int depth = 24;
-    std::vector<MapBlock> blocks;
     std::vector<SpawnPoint> spawns;
     std::vector<MapProp> props;
     std::vector<LightProbe> lights;
@@ -65,6 +48,8 @@ struct MapData {
 
 class MapSerializer {
 public:
+    static std::string serialize(const MapData& map);
+    static MapData deserialize(std::string_view content);
     static bool save(const MapData& map, const std::filesystem::path& path);
     static MapData load(const std::filesystem::path& path);
 };
@@ -79,7 +64,6 @@ public:
     void paintFloor(int y, const std::string& materialId);
     void paintPerimeterWalls(int wallHeight, const std::string& materialId);
     void addCrate(const util::Vec3& position, const std::filesystem::path& modelPath, const std::filesystem::path& materialPath);
-    void addRamp(const Int3& cell, RampDirection direction, const std::string& materialId);
     void addSpawn(Team team, const util::Vec3& position);
     bool exportTopDownPreview(const std::filesystem::path& path) const;
 
@@ -88,9 +72,8 @@ private:
 };
 
 MapData makeDefaultBombDefusalMap(const std::filesystem::path& assetRoot);
+MapData makeMetroStationShowcaseMap(const std::filesystem::path& assetRoot);
 
-bool isRampMaterial(const std::string& materialId);
 float sampleFloorHeight(const MapData& map, float x, float z);
-const char* rampDirectionLabel(RampDirection direction);
 
 }  // namespace mycsg::gameplay

@@ -6,6 +6,10 @@
 #include "util/FileSystem.h"
 #include "util/Log.h"
 
+#include <imgui.h>
+#include <backends/imgui_impl_sdl3.h>
+#include <backends/imgui_impl_vulkan.h>
+
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #define GLM_FORCE_RIGHT_HANDED
 #include <glm/glm.hpp>
@@ -18,6 +22,7 @@
 #include <stb_image.h>
 
 #ifdef _WIN32
+#include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <windows.h>
 #else
@@ -39,6 +44,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <map>
 #include <memory>
@@ -279,6 +285,18 @@ public:
     template <typename Fn>
     Fn loadDevice(const std::string_view name) const {
         return reinterpret_cast<Fn>(vkGetDeviceProcAddr(device_, name.data()));
+    }
+
+    PFN_vkVoidFunction loadAny(const char* name) const {
+        if (device_ != VK_NULL_HANDLE && vkGetDeviceProcAddr != nullptr) {
+            if (PFN_vkVoidFunction function = vkGetDeviceProcAddr(device_, name)) {
+                return function;
+            }
+        }
+        if (vkGetInstanceProcAddr != nullptr) {
+            return vkGetInstanceProcAddr(instance_, name);
+        }
+        return nullptr;
     }
 
 #ifdef _WIN32
@@ -823,13 +841,26 @@ void clearRect(VulkanDispatch& dispatch,
     dispatch.vkCmdClearAttachments(commandBuffer, 1, &attachment, 1, &rect);
 }
 
+std::string toLowerAscii(std::string value);
+util::Vec3 editorPropOutlineHalfExtents(const gameplay::MapProp& prop);
+
 bool isBlockedCell(const gameplay::MapData& map, const int cellX, const int cellZ) {
     if (cellX < 0 || cellZ < 0 || cellX >= map.width || cellZ >= map.depth) {
         return true;
     }
 
-    for (const auto& block : map.blocks) {
-        if (block.solid && block.cell.x == cellX && block.cell.z == cellZ && block.cell.y >= 1) {
+    const float sampleX = static_cast<float>(cellX) + 0.5f;
+    const float sampleZ = static_cast<float>(cellZ) + 0.5f;
+    for (const auto& prop : map.props) {
+        const std::string key = toLowerAscii(prop.id + " " + prop.modelPath.generic_string());
+        if (key.find("wall") == std::string::npos &&
+            key.find("perimeter") == std::string::npos &&
+            key.find("cover") == std::string::npos) {
+            continue;
+        }
+        const util::Vec3 half = editorPropOutlineHalfExtents(prop);
+        if (std::abs(sampleX - prop.position.x) <= half.x &&
+            std::abs(sampleZ - prop.position.z) <= half.z) {
             return true;
         }
     }
@@ -838,11 +869,9 @@ bool isBlockedCell(const gameplay::MapData& map, const int cellX, const int cell
 }
 
 bool hasRampCell(const gameplay::MapData& map, const int cellX, const int cellZ) {
-    for (const auto& block : map.blocks) {
-        if (block.cell.x == cellX && block.cell.z == cellZ && gameplay::isRampMaterial(block.materialId)) {
-            return true;
-        }
-    }
+    (void)map;
+    (void)cellX;
+    (void)cellZ;
     return false;
 }
 
@@ -851,6 +880,26 @@ std::string toLowerAscii(std::string value) {
         character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
     }
     return value;
+}
+
+std::string describeEditorPropLabel(const gameplay::MapProp& prop) {
+    const std::string key = toLowerAscii(prop.id + " " + prop.modelPath.generic_string());
+    if (key.find("editor_brush_floor") != std::string::npos) {
+        return "地面盒体";
+    }
+    if (key.find("editor_brush_perimeter") != std::string::npos) {
+        return "边界墙";
+    }
+    if (key.find("editor_brush_wall") != std::string::npos) {
+        return "盒体墙";
+    }
+    if (key.find("barrel") != std::string::npos) {
+        return "金属油桶";
+    }
+    if (key.find("crate") != std::string::npos) {
+        return "木箱";
+    }
+    return prop.id.empty() ? "道具" : prop.id;
 }
 
 struct PropVisualProfile {
@@ -891,6 +940,71 @@ PropVisualProfile describeProp(const gameplay::MapProp& prop) {
         };
     }
     return {};
+}
+
+glm::mat4 buildPropModelMatrix(const gameplay::MapProp& prop) {
+    const glm::vec3 propScale{
+        std::max(0.001f, std::abs(prop.scale.x)),
+        std::max(0.001f, std::abs(prop.scale.y)),
+        std::max(0.001f, std::abs(prop.scale.z)),
+    };
+    return
+        glm::translate(glm::mat4(1.0f), glm::vec3(prop.position.x, prop.position.y, prop.position.z)) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(prop.rotationDegrees.y), glm::vec3(0.0f, 1.0f, 0.0f)) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(prop.rotationDegrees.x), glm::vec3(1.0f, 0.0f, 0.0f)) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(prop.rotationDegrees.z), glm::vec3(0.0f, 0.0f, 1.0f)) *
+        glm::scale(glm::mat4(1.0f), propScale);
+}
+
+util::Vec3 editorPropOutlineHalfExtents(const gameplay::MapProp& prop) {
+    const std::string key = toLowerAscii(prop.id + " " + prop.modelPath.generic_string());
+    if (key.find("editor_brush") != std::string::npos ||
+        toLowerAscii(prop.modelPath.filename().string()) == "crate.obj") {
+        return {
+            0.50f * std::max(0.001f, std::abs(prop.scale.x)),
+            0.50f * std::max(0.001f, std::abs(prop.scale.y)),
+            0.50f * std::max(0.001f, std::abs(prop.scale.z)),
+        };
+    }
+    const auto profile = describeProp(prop);
+    switch (profile.shape) {
+        case PropVisualProfile::Shape::Barrel:
+            return {
+                0.34f * std::max(0.001f, std::abs(prop.scale.x)),
+                0.55f * std::max(0.001f, std::abs(prop.scale.y)),
+                0.34f * std::max(0.001f, std::abs(prop.scale.z)),
+            };
+        case PropVisualProfile::Shape::Crate:
+            return {
+                0.48f * std::max(0.001f, std::abs(prop.scale.x)),
+                0.48f * std::max(0.001f, std::abs(prop.scale.y)),
+                0.48f * std::max(0.001f, std::abs(prop.scale.z)),
+            };
+        case PropVisualProfile::Shape::Generic:
+        default:
+            return {
+                0.42f * std::max(0.001f, std::abs(prop.scale.x)),
+                0.52f * std::max(0.001f, std::abs(prop.scale.y)),
+                0.42f * std::max(0.001f, std::abs(prop.scale.z)),
+            };
+    }
+}
+
+std::string staticWorldMeshCacheKey(const gameplay::MapData& map) {
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&hash](const std::uint64_t value) {
+        hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    };
+
+    mix(static_cast<std::uint64_t>(map.width));
+    mix(static_cast<std::uint64_t>(map.height));
+    mix(static_cast<std::uint64_t>(map.depth));
+    mix(static_cast<std::uint64_t>(map.props.size()));
+    mix(static_cast<std::uint64_t>(map.spawns.size()));
+
+    std::ostringstream key;
+    key << map.name << ':' << std::hex << hash;
+    return key.str();
 }
 
 struct PreviewTriangle {
@@ -939,6 +1053,178 @@ struct ProjectedVertex {
     float y = 0.0f;
     float z = 0.0f;
 };
+
+std::optional<ProjectedVertex> projectWorldPoint(const glm::mat4& projectionView,
+                                                 const util::Vec3& point,
+                                                 const float widthPx,
+                                                 const float heightPx) {
+    const glm::vec4 clip = projectionView * glm::vec4(point.x, point.y, point.z, 1.0f);
+    if (clip.w <= 0.0001f) {
+        return std::nullopt;
+    }
+
+    const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+    if (ndc.z < 0.0f || ndc.z > 1.0f) {
+        return std::nullopt;
+    }
+
+    return ProjectedVertex{
+        (ndc.x * 0.5f + 0.5f) * widthPx,
+        (ndc.y * 0.5f + 0.5f) * heightPx,
+        ndc.z,
+    };
+}
+
+glm::mat4 buildMapEditorProjectionMatrix(const RenderFrame& renderFrame,
+                                         const float widthPx,
+                                         const float heightPx) {
+    const float safeHeight = std::max(1.0f, heightPx);
+    const float aspect = widthPx / safeHeight;
+    if (renderFrame.editorIsOrthoView) {
+        const float span = std::max(4.0f, renderFrame.editorOrthoSpan);
+        glm::mat4 projection = glm::orthoRH_ZO(
+            -span * aspect,
+            span * aspect,
+            -span,
+            span,
+            0.05f,
+            256.0f);
+        projection[1][1] *= -1.0f;
+        return projection;
+    }
+
+    glm::mat4 projection = glm::perspectiveRH_ZO(1.08f, aspect, 0.05f, 192.0f);
+    projection[1][1] *= -1.0f;
+    return projection;
+}
+
+glm::mat4 buildMapEditorViewMatrix(const RenderFrame& renderFrame,
+                                   const gameplay::MapData& map) {
+    if (renderFrame.editorIsOrthoView) {
+        const float eyeHeight = std::max(
+            static_cast<float>(std::max(map.height, 8)) + 12.0f,
+            renderFrame.editorOrthoSpan * 2.2f);
+        return glm::lookAtRH(
+            glm::vec3(renderFrame.cameraPosition.x, eyeHeight, renderFrame.cameraPosition.z),
+            glm::vec3(renderFrame.cameraPosition.x, 0.0f, renderFrame.cameraPosition.z),
+            glm::vec3(0.0f, 0.0f, -1.0f));
+    }
+
+    const util::Vec3 eye = renderFrame.cameraPosition;
+    const util::Vec3 target{
+        eye.x + std::cos(renderFrame.cameraYawRadians) * std::cos(renderFrame.cameraPitchRadians),
+        eye.y + std::sin(renderFrame.cameraPitchRadians),
+        eye.z + std::sin(renderFrame.cameraYawRadians) * std::cos(renderFrame.cameraPitchRadians),
+    };
+    return glm::lookAtRH(
+        glm::vec3(eye.x, eye.y, eye.z),
+        glm::vec3(target.x, target.y, target.z),
+        glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+std::array<util::Vec3, 8> buildEditorPropOutlineCorners(const gameplay::MapProp& prop) {
+    const util::Vec3 half = editorPropOutlineHalfExtents(prop);
+    const glm::mat4 transform =
+        glm::translate(glm::mat4(1.0f), glm::vec3(prop.position.x, prop.position.y, prop.position.z)) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(prop.rotationDegrees.y), glm::vec3(0.0f, 1.0f, 0.0f)) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(prop.rotationDegrees.x), glm::vec3(1.0f, 0.0f, 0.0f)) *
+        glm::rotate(glm::mat4(1.0f), glm::radians(prop.rotationDegrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
+    const std::array<glm::vec3, 8> localCorners{{
+        {-half.x, 0.0f, -half.z},
+        { half.x, 0.0f, -half.z},
+        {-half.x, half.y * 2.0f, -half.z},
+        { half.x, half.y * 2.0f, -half.z},
+        {-half.x, 0.0f,  half.z},
+        { half.x, 0.0f,  half.z},
+        {-half.x, half.y * 2.0f,  half.z},
+        { half.x, half.y * 2.0f,  half.z},
+    }};
+
+    std::array<util::Vec3, 8> worldCorners{};
+    for (std::size_t index = 0; index < localCorners.size(); ++index) {
+        const glm::vec4 world = transform * glm::vec4(localCorners[index], 1.0f);
+        worldCorners[index] = {world.x, world.y, world.z};
+    }
+    return worldCorners;
+}
+
+void recordProjectedLine(VulkanDispatch& dispatch,
+                         const VkCommandBuffer commandBuffer,
+                         const VkExtent2D extent,
+                         const VkClearAttachment& attachment,
+                         const float x0,
+                         const float y0,
+                         const float x1,
+                         const float y1,
+                         const float thicknessPx) {
+    const float dx = x1 - x0;
+    const float dy = y1 - y0;
+    const int steps = std::max(1, static_cast<int>(std::ceil(std::max(std::abs(dx), std::abs(dy)))));
+    const float half = thicknessPx * 0.5f;
+    for (int step = 0; step <= steps; ++step) {
+        const float t = static_cast<float>(step) / static_cast<float>(steps);
+        const float x = x0 + dx * t;
+        const float y = y0 + dy * t;
+        clearRect(dispatch, commandBuffer, attachment,
+            makePixelRect(extent, x - half, y - half, x + half, y + half));
+    }
+}
+
+bool recordPropOutline(VulkanDispatch& dispatch,
+                       const VkCommandBuffer commandBuffer,
+                       const VkExtent2D extent,
+                       const glm::mat4& projectionView,
+                       const gameplay::MapProp& prop,
+                       const VkClearAttachment& attachment,
+                       const float thicknessPx,
+                       float* outMinY = nullptr,
+                       float* outMidX = nullptr) {
+    const auto worldCorners = buildEditorPropOutlineCorners(prop);
+    std::array<ProjectedVertex, 8> projectedCorners{};
+    bool anyProjected = false;
+    float minY = static_cast<float>(extent.height);
+    float minX = static_cast<float>(extent.width);
+    float maxX = 0.0f;
+
+    for (std::size_t index = 0; index < worldCorners.size(); ++index) {
+        const auto projected = projectWorldPoint(
+            projectionView,
+            worldCorners[index],
+            static_cast<float>(extent.width),
+            static_cast<float>(extent.height));
+        if (!projected.has_value()) {
+            return false;
+        }
+        projectedCorners[index] = *projected;
+        anyProjected = true;
+        minY = std::min(minY, projected->y);
+        minX = std::min(minX, projected->x);
+        maxX = std::max(maxX, projected->x);
+    }
+
+    if (!anyProjected) {
+        return false;
+    }
+
+    static constexpr std::array<std::array<int, 2>, 12> kEdges{{
+        {{0, 1}}, {{1, 3}}, {{3, 2}}, {{2, 0}},
+        {{4, 5}}, {{5, 7}}, {{7, 6}}, {{6, 4}},
+        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+    }};
+    for (const auto& edge : kEdges) {
+        const auto& a = projectedCorners[static_cast<std::size_t>(edge[0])];
+        const auto& b = projectedCorners[static_cast<std::size_t>(edge[1])];
+        recordProjectedLine(dispatch, commandBuffer, extent, attachment, a.x, a.y, b.x, b.y, thicknessPx);
+    }
+
+    if (outMinY != nullptr) {
+        *outMinY = minY;
+    }
+    if (outMidX != nullptr) {
+        *outMidX = (minX + maxX) * 0.5f;
+    }
+    return true;
+}
 
 VkClearAttachment makeAttachment(const util::Vec3& color, const float intensity = 1.0f) {
     return makeAttachment(
@@ -1017,6 +1303,13 @@ public:
             return false;
         }
 
+        if (!initializeImGui(window)) {
+            shutdown();
+            return false;
+        }
+
+        hostWindow_ = &window;
+
         return true;
     }
 
@@ -1040,6 +1333,7 @@ public:
             worldPrinted_ = true;
         }
 
+        beginImGuiFrame(frame);
         drawFrame(frame);
 
         if (!bitmapUiLogged_) {
@@ -1048,11 +1342,30 @@ public:
         }
     }
 
+    bool wantsKeyboardCapture() const override {
+        return imguiKeyboardCapture_;
+    }
+
+    bool wantsMouseCapture() const override {
+        return imguiMouseCapture_;
+    }
+
+    std::vector<UiAction> consumeUiActions() override {
+        std::vector<UiAction> actions;
+        actions.swap(pendingUiActions_);
+        return actions;
+    }
+
     void shutdown() override {
         if (device_ != VK_NULL_HANDLE && dispatch_.vkDeviceWaitIdle != nullptr) {
             dispatch_.vkDeviceWaitIdle(device_);
         }
 
+        if (hostWindow_ != nullptr) {
+            hostWindow_->setNativeEventObserver({});
+            hostWindow_ = nullptr;
+        }
+        shutdownImGui();
         destroyMeshResources();
         destroySwapchainResources();
 
@@ -1110,6 +1423,618 @@ private:
             attachment.clearValue.color.float32[2],
             attachment.clearValue.color.float32[3],
         };
+    }
+
+    static void processNativeEvent(const void* event, void* userData) {
+        if (event == nullptr || userData == nullptr) {
+            return;
+        }
+
+        auto* renderer = static_cast<VulkanRenderer*>(userData);
+        if (!renderer->imguiInitialized_) {
+            return;
+        }
+        ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event*>(event));
+    }
+
+    static PFN_vkVoidFunction loadImGuiFunction(const char* functionName, void* userData) {
+        if (functionName == nullptr || userData == nullptr) {
+            return nullptr;
+        }
+        return static_cast<VulkanDispatch*>(userData)->loadAny(functionName);
+    }
+
+    bool initializeImGui(platform::IWindow& window) {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.ConfigWindowsMoveFromTitleBarOnly = true;
+        io.IniFilename = "imgui.ini";
+        applyImGuiStyle();
+
+        std::filesystem::path fontPath = resolveImGuiFontPath();
+        ImFontConfig fontConfig{};
+        fontConfig.OversampleH = 2;
+        fontConfig.OversampleV = 2;
+        fontConfig.RasterizerMultiply = 1.05f;
+        static const ImWchar glyphRanges[] = {
+            0x0020, 0x00FF,
+            0x2000, 0x206F,
+            0x3000, 0x30FF,
+            0x4E00, 0x9FFF,
+            0,
+        };
+        if (!fontPath.empty()) {
+            if (io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 20.0f, &fontConfig, glyphRanges) != nullptr) {
+                spdlog::info("[ImGui] Loaded UI font: {}", fontPath.generic_string());
+            } else {
+                spdlog::warn("[ImGui] Failed to load UI font: {}", fontPath.generic_string());
+            }
+        }
+        if (io.Fonts->Fonts.empty()) {
+            io.Fonts->AddFontDefault();
+            spdlog::warn("[ImGui] Falling back to default font; Chinese glyph coverage may be limited.");
+        }
+
+        if (!ImGui_ImplSDL3_InitForVulkan(sdlWindow_)) {
+            spdlog::error("[ImGui] Failed to initialize SDL3 backend.");
+            ImGui::DestroyContext();
+            return false;
+        }
+        window.setNativeEventObserver({&VulkanRenderer::processNativeEvent, this});
+
+        if (!ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_0, &VulkanRenderer::loadImGuiFunction, &dispatch_)) {
+            spdlog::error("[ImGui] Failed to load Vulkan function table.");
+            window.setNativeEventObserver({});
+            ImGui_ImplSDL3_Shutdown();
+            ImGui::DestroyContext();
+            return false;
+        }
+
+        ImGui_ImplVulkan_InitInfo initInfo{};
+        initInfo.ApiVersion = VK_API_VERSION_1_0;
+        initInfo.Instance = instance_;
+        initInfo.PhysicalDevice = physicalDevice_;
+        initInfo.Device = device_;
+        initInfo.QueueFamily = queueFamilyIndex_;
+        initInfo.Queue = graphicsQueue_;
+        initInfo.DescriptorPoolSize = 96;
+        initInfo.MinImageCount = static_cast<std::uint32_t>(std::max<std::size_t>(2, frames_.size()));
+        initInfo.ImageCount = static_cast<std::uint32_t>(frames_.size());
+        initInfo.PipelineInfoMain.RenderPass = renderPass_;
+        initInfo.PipelineInfoMain.Subpass = 0;
+        initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        initInfo.UseDynamicRendering = false;
+        initInfo.MinAllocationSize = 1024 * 1024;
+        initInfo.CheckVkResultFn = [](VkResult result) {
+            if (result != VK_SUCCESS) {
+                spdlog::warn("[ImGui] Vulkan backend reported result {}", static_cast<int>(result));
+            }
+        };
+        if (!ImGui_ImplVulkan_Init(&initInfo)) {
+            spdlog::error("[ImGui] Failed to initialize Vulkan backend.");
+            window.setNativeEventObserver({});
+            ImGui_ImplSDL3_Shutdown();
+            ImGui::DestroyContext();
+            return false;
+        }
+
+        imguiInitialized_ = true;
+        imguiKeyboardCapture_ = false;
+        imguiMouseCapture_ = false;
+        return true;
+    }
+
+    void shutdownImGui() {
+        if (!imguiInitialized_) {
+            return;
+        }
+
+        imguiKeyboardCapture_ = false;
+        imguiMouseCapture_ = false;
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        imguiInitialized_ = false;
+    }
+
+    void beginImGuiFrame(const RenderFrame& renderFrame) {
+        if (!imguiInitialized_) {
+            imguiKeyboardCapture_ = false;
+            imguiMouseCapture_ = false;
+            return;
+        }
+
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
+        buildImGuiWindows(renderFrame);
+        ImGuiIO& io = ImGui::GetIO();
+        imguiKeyboardCapture_ = io.WantCaptureKeyboard;
+        imguiMouseCapture_ = io.WantCaptureMouse;
+        ImGui::Render();
+    }
+
+    void queueUiAction(const UiActionType type, const std::int32_t value0 = 0, const std::int32_t value1 = 0) {
+        pendingUiActions_.push_back(UiAction{
+            .type = type,
+            .value0 = value0,
+            .value1 = value1,
+            .text = {},
+            .vectorValue = {},
+        });
+    }
+
+    void queueUiTextAction(const UiActionType type, std::string text) {
+        pendingUiActions_.push_back(UiAction{
+            .type = type,
+            .text = std::move(text),
+            .vectorValue = {},
+        });
+    }
+
+    void queueUiVec3Action(const UiActionType type, const util::Vec3& vectorValue) {
+        pendingUiActions_.push_back(UiAction{
+            .type = type,
+            .text = {},
+            .vectorValue = vectorValue,
+        });
+    }
+
+    void copyStringToBuffer(std::array<char, 128>& buffer, const std::string& value) {
+        buffer.fill('\0');
+        const std::size_t count = std::min(buffer.size() - 1, value.size());
+        std::memcpy(buffer.data(), value.data(), count);
+    }
+
+    void syncMultiplayerDraft(const RenderFrame& renderFrame) {
+        if (multiplayerDraftInitialized_) {
+            return;
+        }
+        multiplayerDraftInitialized_ = true;
+        multiplayerSessionTypeDraft_ = renderFrame.multiplayerSessionTypeIndex;
+        multiplayerPortDraft_ = renderFrame.multiplayerPort;
+        multiplayerMaxPlayersDraft_ = renderFrame.multiplayerMaxPlayers;
+        copyStringToBuffer(multiplayerHostDraft_, renderFrame.multiplayerHost);
+    }
+
+    void emitMultiplayerDraftChanges(const RenderFrame& renderFrame) {
+        if (multiplayerSessionTypeDraft_ != renderFrame.multiplayerSessionTypeIndex) {
+            queueUiAction(UiActionType::SetMultiplayerSessionType, multiplayerSessionTypeDraft_);
+        }
+
+        const std::string draftHost(multiplayerHostDraft_.data());
+        if (draftHost != renderFrame.multiplayerHost) {
+            queueUiTextAction(UiActionType::SetMultiplayerHost, draftHost);
+        }
+
+        if (multiplayerPortDraft_ != renderFrame.multiplayerPort) {
+            queueUiAction(UiActionType::SetMultiplayerPort, multiplayerPortDraft_);
+        }
+
+        if (multiplayerMaxPlayersDraft_ != renderFrame.multiplayerMaxPlayers) {
+            queueUiAction(UiActionType::SetMultiplayerMaxPlayers, multiplayerMaxPlayersDraft_);
+        }
+    }
+
+    void buildImGuiWindows(const RenderFrame& renderFrame) {
+        if (renderFrame.appFlow != app::AppFlow::MultiPlayerLobby &&
+            renderFrame.appFlow != app::AppFlow::MapEditor) {
+            multiplayerDraftInitialized_ = false;
+            return;
+        }
+
+        switch (renderFrame.appFlow) {
+            case app::AppFlow::MultiPlayerLobby:
+            {
+                syncMultiplayerDraft(renderFrame);
+                ImGui::SetNextWindowPos(ImVec2(42.0f, 38.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(580.0f, 420.0f), ImGuiCond_Always);
+                constexpr ImGuiWindowFlags kMultiplayerWindowFlags =
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoSavedSettings;
+                if (ImGui::Begin("联机房间工具", nullptr, kMultiplayerWindowFlags)) {
+                    ImGui::Text("地图  %s", renderFrame.multiplayerMapLabel.c_str());
+                    ImGui::SeparatorText("房间参数");
+
+                    constexpr ImGuiTableFlags kFormTableFlags =
+                        ImGuiTableFlags_SizingFixedFit |
+                        ImGuiTableFlags_BordersInnerV;
+                    if (ImGui::BeginTable("multiplayer_form", 2, kFormTableFlags)) {
+                        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 108.0f);
+                        ImGui::TableSetupColumn("control", ImGuiTableColumnFlags_WidthStretch);
+
+                        auto nextFormRow = [](const char* label) {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::AlignTextToFramePadding();
+                            ImGui::TextUnformatted(label);
+                            ImGui::TableSetColumnIndex(1);
+                        };
+
+                        nextFormRow("模式");
+                        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
+                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(18.0f, 10.0f));
+                        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.18f, 0.24f, 0.31f, 0.95f));
+                        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.24f, 0.38f, 0.50f, 0.95f));
+                        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.28f, 0.48f, 0.64f, 1.00f));
+                        ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.98f, 0.86f, 0.48f, 1.00f));
+                        if (ImGui::RadioButton("主机##mp_mode_host", multiplayerSessionTypeDraft_ == 0)) {
+                            multiplayerSessionTypeDraft_ = 0;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::RadioButton("客户端##mp_mode_client", multiplayerSessionTypeDraft_ == 1)) {
+                            multiplayerSessionTypeDraft_ = 1;
+                        }
+                        ImGui::PopStyleColor(4);
+                        ImGui::PopStyleVar(2);
+
+                        nextFormRow("地图");
+                        const char* currentMapPreview = renderFrame.mapBrowserItems.empty()
+                            ? "没有可用地图"
+                            : renderFrame.mapBrowserItems[std::min(renderFrame.mapBrowserSelectedIndex, renderFrame.mapBrowserItems.size() - 1)].c_str();
+                        const bool hasAnyMap = !renderFrame.mapBrowserItems.empty();
+                        if (!hasAnyMap) {
+                            ImGui::BeginDisabled();
+                        }
+                        if (ImGui::BeginCombo("##mp_map", currentMapPreview)) {
+                            for (std::size_t index = 0; index < renderFrame.mapBrowserItems.size(); ++index) {
+                                const bool selected = index == renderFrame.mapBrowserSelectedIndex;
+                                if (ImGui::Selectable(renderFrame.mapBrowserItems[index].c_str(), selected)) {
+                                    queueUiAction(UiActionType::SelectMapBrowserItem, static_cast<std::int32_t>(index));
+                                }
+                                if (selected) {
+                                    ImGui::SetItemDefaultFocus();
+                                }
+                            }
+                            ImGui::EndCombo();
+                        }
+                        if (!hasAnyMap) {
+                            ImGui::EndDisabled();
+                        }
+
+                        nextFormRow("服务器");
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        ImGui::InputTextWithHint("##mp_host", "127.0.0.1", multiplayerHostDraft_.data(), multiplayerHostDraft_.size());
+
+                        nextFormRow("端口");
+                        ImGui::SetNextItemWidth(180.0f);
+                        if (ImGui::InputInt("##mp_port", &multiplayerPortDraft_, 1, 100)) {
+                            multiplayerPortDraft_ = std::clamp(multiplayerPortDraft_, 1, 65535);
+                        }
+
+                        nextFormRow("房间人数");
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        ImGui::SliderInt("##mp_max_players", &multiplayerMaxPlayersDraft_, 2, 32, "%d 人");
+
+                        nextFormRow("当前地址");
+                        ImGui::TextUnformatted(renderFrame.multiplayerEndpointLabel.c_str());
+
+                        nextFormRow("状态");
+                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+                        ImGui::TextUnformatted(renderFrame.multiplayerStatusLabel.c_str());
+                        ImGui::PopTextWrapPos();
+
+                        ImGui::EndTable();
+                    }
+
+                    ImGui::SeparatorText("操作");
+                    const float buttonWidth = (ImGui::GetContentRegionAvail().x - 12.0f) / 3.0f;
+                    if (ImGui::Button("应用网络参数", ImVec2(buttonWidth, 0.0f))) {
+                        emitMultiplayerDraftChanges(renderFrame);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(renderFrame.multiplayerSessionActive ? "重新启动会话" : "启动会话", ImVec2(buttonWidth, 0.0f))) {
+                        emitMultiplayerDraftChanges(renderFrame);
+                        queueUiAction(UiActionType::ActivateMultiplayerSetting, 3);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("返回主菜单", ImVec2(buttonWidth, 0.0f))) {
+                        queueUiAction(UiActionType::ReturnToMainMenu);
+                    }
+                }
+                ImGui::End();
+                break;
+            }
+            case app::AppFlow::MapEditor:
+            {
+                ImGui::SetNextWindowPos(ImVec2(28.0f, 30.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(540.0f, 760.0f), ImGuiCond_Always);
+                constexpr ImGuiWindowFlags kEditorWindowFlags =
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoSavedSettings;
+                if (ImGui::Begin("地图编辑器控制台", nullptr, kEditorWindowFlags)) {
+                    ImGui::Text("地图  %s", renderFrame.editorMapFileLabel.c_str());
+                    ImGui::Text("索引  %zu / %zu", renderFrame.editorMapIndex + 1, std::max<std::size_t>(renderFrame.editorMapCount, 1));
+                    ImGui::Text("视图  %s", renderFrame.editorViewModeLabel.c_str());
+                    ImGui::Text("目标  %.2f, %.2f, %.2f",
+                        renderFrame.editorTargetPosition.x,
+                        renderFrame.editorTargetPosition.y,
+                        renderFrame.editorTargetPosition.z);
+                    ImGui::Text("相机  %.1f, %.1f, %.1f",
+                        renderFrame.cameraPosition.x,
+                        renderFrame.cameraPosition.y,
+                        renderFrame.cameraPosition.z);
+
+                    ImGui::SeparatorText("工具");
+                    static constexpr std::array<const char*, 3> kToolLabels{
+                        "选择",
+                        "放置",
+                        "擦除",
+                    };
+                    for (std::size_t toolIndex = 0; toolIndex < kToolLabels.size(); ++toolIndex) {
+                        if (toolIndex > 0) {
+                            ImGui::SameLine();
+                        }
+                        if (ImGui::Selectable(
+                                kToolLabels[toolIndex],
+                                renderFrame.editorToolLabel == kToolLabels[toolIndex],
+                                0,
+                                ImVec2(92.0f, 0.0f))) {
+                            queueUiAction(UiActionType::SelectMapEditorTool, static_cast<std::int32_t>(toolIndex));
+                        }
+                    }
+
+                    ImGui::SeparatorText("视图");
+                    if (ImGui::Selectable("自由镜头", !renderFrame.editorIsOrthoView, 0, ImVec2(120.0f, 0.0f)) &&
+                        renderFrame.editorIsOrthoView) {
+                        queueUiAction(UiActionType::ToggleMapEditorProjection);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Selectable("正交俯视", renderFrame.editorIsOrthoView, 0, ImVec2(120.0f, 0.0f)) &&
+                        !renderFrame.editorIsOrthoView) {
+                        queueUiAction(UiActionType::ToggleMapEditorProjection);
+                    }
+                    ImGui::TextWrapped(
+                        renderFrame.editorIsOrthoView
+                            ? "正交视图下使用 WASD 平移，Space/Ctrl 缩放。"
+                            : "自由镜头下按住右键环视，WASD 飞行，Space/Ctrl 升降。");
+
+                    if (renderFrame.editorToolLabel == "放置") {
+                        ImGui::SeparatorText("放置类型");
+                        static constexpr std::array<const char*, 4> kPlacementLabels{
+                            "盒体墙",
+                            "道具",
+                            "进攻出生点",
+                            "防守出生点",
+                        };
+                        for (std::size_t placementIndex = 0; placementIndex < kPlacementLabels.size(); ++placementIndex) {
+                            if (placementIndex > 0) {
+                                ImGui::SameLine();
+                            }
+                            if (ImGui::Selectable(
+                                    kPlacementLabels[placementIndex],
+                                    renderFrame.editorPlacementKindLabel == kPlacementLabels[placementIndex],
+                                    0,
+                                    ImVec2(placementIndex >= 2 ? 110.0f : 84.0f, 0.0f))) {
+                                queueUiAction(UiActionType::SelectMapEditorPlacementKind, static_cast<std::int32_t>(placementIndex));
+                            }
+                        }
+
+                        if (renderFrame.editorPlacementKindLabel == "盒体墙") {
+                            ImGui::Text("墙体材质: %s", renderFrame.editorWallMaterialLabel.c_str());
+                            static constexpr std::array<const char*, 4> kWallMaterialLabels{
+                                "战术掩体",
+                                "混凝土墙",
+                                "A 点红色标记",
+                                "B 点蓝色标记",
+                            };
+                            for (std::size_t materialIndex = 0; materialIndex < kWallMaterialLabels.size(); ++materialIndex) {
+                                if (materialIndex > 0) {
+                                    ImGui::SameLine();
+                                }
+                                if (ImGui::Selectable(kWallMaterialLabels[materialIndex],
+                                        renderFrame.editorWallMaterialLabel == kWallMaterialLabels[materialIndex],
+                                        0,
+                                        ImVec2(materialIndex == 1 ? 88.0f : 116.0f, 0.0f))) {
+                                    queueUiAction(UiActionType::SelectEditorWallMaterial, static_cast<std::int32_t>(materialIndex));
+                                }
+                            }
+                        } else if (renderFrame.editorPlacementKindLabel == "道具") {
+                            ImGui::Text("道具模板: %s", renderFrame.editorPropPresetLabel.c_str());
+                            static constexpr std::array<const char*, 2> kPropPresetLabels{
+                                "木箱",
+                                "金属油桶",
+                            };
+                            for (std::size_t presetIndex = 0; presetIndex < kPropPresetLabels.size(); ++presetIndex) {
+                                if (presetIndex > 0) {
+                                    ImGui::SameLine();
+                                }
+                                if (ImGui::Selectable(kPropPresetLabels[presetIndex],
+                                        renderFrame.editorPropPresetLabel == kPropPresetLabels[presetIndex],
+                                        0,
+                                        ImVec2(96.0f, 0.0f))) {
+                                    queueUiAction(UiActionType::SelectEditorPropPreset, static_cast<std::int32_t>(presetIndex));
+                                }
+                            }
+                        }
+
+                        ImGui::TextWrapped("光标指中的位置会显示放置虚影。左键或 Enter 立即放置，R 旋转，Tab 切换缩放。");
+                    } else if (renderFrame.editorToolLabel == "选择") {
+                        ImGui::SeparatorText("选择");
+                        if (renderFrame.hoveredEditorPropIndex >= 0) {
+                            ImGui::TextWrapped("当前悬停对象: %s", renderFrame.selectedEditorPropLabel.c_str());
+                        } else if (renderFrame.hoveredEditorSpawnIndex >= 0) {
+                            ImGui::TextWrapped("当前悬停对象: %s", renderFrame.editorCellSpawnLabel.c_str());
+                        } else {
+                            ImGui::TextWrapped("把鼠标指向场景对象即可自动选中。点击不会执行操作。");
+                        }
+                    } else {
+                        ImGui::SeparatorText("擦除");
+                        if (renderFrame.eraseEditorPropIndex >= 0 || renderFrame.eraseEditorSpawnIndex >= 0) {
+                            ImGui::TextColored(ImVec4(0.98f, 0.56f, 0.38f, 1.00f), "当前高亮对象会在点击时被删除。");
+                        } else {
+                            ImGui::TextWrapped("把鼠标移到对象上会显示红色警示高亮，左键即可擦除。");
+                        }
+                    }
+
+                    ImGui::SeparatorText("当前目标");
+                    ImGui::Text("地面: %s", renderFrame.editorCellFloorLabel.c_str());
+                    ImGui::Text("掩体: %s", renderFrame.editorCellCoverLabel.c_str());
+                    ImGui::Text("道具: %s", renderFrame.editorCellPropLabel.c_str());
+                    ImGui::Text("出生点: %s", renderFrame.editorCellSpawnLabel.c_str());
+
+                    ImGui::SeparatorText("对象参数");
+                    if (renderFrame.hasSelectedEditorProp) {
+                        ImGui::Text("名称: %s", renderFrame.selectedEditorPropLabel.c_str());
+                        ImGui::TextWrapped("模型: %s", renderFrame.selectedEditorPropModelLabel.c_str());
+                        ImGui::TextWrapped("材质: %s", renderFrame.selectedEditorPropMaterialLabel.c_str());
+                        if (ImGui::BeginTable("editor-prop-inspector", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
+                            auto drawVec3Editor = [&](const char* label,
+                                                      const char* widgetId,
+                                                      const util::Vec3& value,
+                                                      const float speed,
+                                                      const float minValue,
+                                                      const float maxValue,
+                                                      const UiActionType actionType,
+                                                      const char* format) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::AlignTextToFramePadding();
+                                ImGui::TextUnformatted(label);
+                                ImGui::TableSetColumnIndex(1);
+                                float components[3]{value.x, value.y, value.z};
+                                ImGui::SetNextItemWidth(-1.0f);
+                                if (ImGui::DragFloat3(widgetId, components, speed, minValue, maxValue, format)) {
+                                    queueUiVec3Action(actionType, util::Vec3{components[0], components[1], components[2]});
+                                }
+                            };
+
+                            drawVec3Editor("位置", "##selected-prop-position", renderFrame.selectedEditorPropPosition,
+                                0.05f, -64.0f, 128.0f, UiActionType::SetSelectedEditorPropPosition, "%.2f");
+                            drawVec3Editor("旋转", "##selected-prop-rotation", renderFrame.selectedEditorPropRotationDegrees,
+                                1.0f, -360.0f, 360.0f, UiActionType::SetSelectedEditorPropRotation, "%.0f deg");
+                            drawVec3Editor("缩放", "##selected-prop-scale", renderFrame.selectedEditorPropScale,
+                                0.05f, 0.05f, 8.0f, UiActionType::SetSelectedEditorPropScale, "%.2f");
+                            ImGui::EndTable();
+                        }
+                    } else {
+                        ImGui::TextWrapped("当前没有选中的可编辑对象。切到“选择”工具并把鼠标指向场景道具后，这里会显示参数。");
+                    }
+
+                    ImGui::SeparatorText("操作");
+                    const float buttonWidth = (ImGui::GetContentRegionAvail().x - 16.0f) / 3.0f;
+                    if (ImGui::Button("应用工具", ImVec2(buttonWidth, 0.0f))) {
+                        if (renderFrame.editorToolLabel == "擦除") {
+                            queueUiAction(UiActionType::EraseMapEditorCell);
+                        } else if (renderFrame.editorToolLabel != "选择") {
+                            queueUiAction(UiActionType::ApplyMapEditorTool);
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (!renderFrame.editorUndoAvailable) {
+                        ImGui::BeginDisabled();
+                    }
+                    if (ImGui::Button("撤销", ImVec2(buttonWidth, 0.0f))) {
+                        queueUiAction(UiActionType::UndoMapEditorChange);
+                    }
+                    if (!renderFrame.editorUndoAvailable) {
+                        ImGui::EndDisabled();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("保存地图", ImVec2(buttonWidth, 0.0f))) {
+                        queueUiAction(UiActionType::SaveEditorMap);
+                    }
+                    if (ImGui::Button("上一张地图")) {
+                        queueUiAction(UiActionType::CycleEditorMap, -1);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("下一张地图")) {
+                        queueUiAction(UiActionType::CycleEditorMap, 1);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("新建地图")) {
+                        queueUiAction(UiActionType::CreateEditorMap);
+                    }
+                    if (ImGui::Button("返回主菜单")) {
+                        queueUiAction(UiActionType::ReturnToMainMenu);
+                    }
+
+                    ImGui::SeparatorText("统计");
+                    ImGui::Text("道具总数: %d", renderFrame.editorPropCount);
+                    ImGui::Text("出生点总数: %d", renderFrame.editorSpawnCount);
+                    ImGui::Separator();
+                    ImGui::TextWrapped("状态: %s", renderFrame.editorStatusLabel.c_str());
+                }
+                ImGui::End();
+                break;
+            }
+            case app::AppFlow::MainMenu:
+            case app::AppFlow::MapBrowser:
+            case app::AppFlow::Settings:
+            case app::AppFlow::Exit:
+            case app::AppFlow::SinglePlayerLobby:
+                break;
+        }
+    }
+
+    void applyImGuiStyle() {
+        ImGui::StyleColorsDark();
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding = 10.0f;
+        style.ChildRounding = 8.0f;
+        style.FrameRounding = 8.0f;
+        style.GrabRounding = 8.0f;
+        style.PopupRounding = 8.0f;
+        style.ScrollbarRounding = 8.0f;
+        style.TabRounding = 8.0f;
+        style.WindowPadding = ImVec2(14.0f, 12.0f);
+        style.FramePadding = ImVec2(10.0f, 6.0f);
+        style.ItemSpacing = ImVec2(10.0f, 8.0f);
+        style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.10f, 0.13f, 0.92f);
+        style.Colors[ImGuiCol_TitleBg] = ImVec4(0.14f, 0.20f, 0.27f, 1.00f);
+        style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.19f, 0.31f, 0.42f, 1.00f);
+        style.Colors[ImGuiCol_Header] = ImVec4(0.20f, 0.36f, 0.48f, 0.78f);
+        style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.27f, 0.48f, 0.64f, 0.86f);
+        style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.31f, 0.55f, 0.72f, 0.94f);
+        style.Colors[ImGuiCol_Button] = ImVec4(0.21f, 0.42f, 0.56f, 0.76f);
+        style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.54f, 0.71f, 0.92f);
+        style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.35f, 0.60f, 0.78f, 1.00f);
+        style.Colors[ImGuiCol_FrameBg] = ImVec4(0.12f, 0.16f, 0.20f, 0.90f);
+        style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.17f, 0.22f, 0.28f, 0.95f);
+        style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.23f, 0.28f, 0.34f, 1.00f);
+    }
+
+    std::filesystem::path resolveImGuiFontPath() const {
+        std::error_code error;
+        const std::array<std::filesystem::path, 7> candidates{{
+            std::filesystem::path("assets/fonts/NotoSansSC-Variable.ttf"),
+#ifdef MYCSGO_ASSET_ROOT
+            std::filesystem::path(MYCSGO_ASSET_ROOT) / "fonts" / "NotoSansSC-Variable.ttf",
+#else
+            std::filesystem::path(),
+#endif
+#ifdef _WIN32
+            std::filesystem::path("C:/Windows/Fonts/msyh.ttc"),
+            std::filesystem::path("C:/Windows/Fonts/msyh.ttf"),
+            std::filesystem::path("C:/Windows/Fonts/msyhbd.ttc"),
+            std::filesystem::path("C:/Windows/Fonts/simhei.ttf"),
+            std::filesystem::path("C:/Windows/Fonts/simsun.ttc"),
+#else
+            std::filesystem::path(),
+            std::filesystem::path(),
+            std::filesystem::path(),
+            std::filesystem::path(),
+            std::filesystem::path(),
+#endif
+        }};
+
+        for (const auto& candidate : candidates) {
+            if (candidate.empty()) {
+                continue;
+            }
+            if (std::filesystem::exists(candidate, error) && !error) {
+                return candidate;
+            }
+            error.clear();
+        }
+        return {};
     }
 
     bool buildUiFontAtlas(std::vector<unsigned char>& rgbaPixels,
@@ -2118,11 +3043,16 @@ private:
     }
 
     bool ensureStaticWorldMesh(const gameplay::MapData& map) {
-        const std::string key = map.name + ":" + std::to_string(map.width) + "x" + std::to_string(map.depth);
-        if (staticWorldMeshKey_ == key && staticWorldMesh_.vertexCount > 0) {
-            return true;
+        const std::string key = staticWorldMeshCacheKey(map);
+        if (staticWorldMeshKey_ == key) {
+            return staticWorldMesh_.vertexCount > 0;
         }
         vulkan::CpuMesh cpuMesh = vulkan::buildStaticWorldMesh(map);
+        if (!cpuMesh.valid || cpuMesh.vertices.empty()) {
+            destroyBuffer(staticWorldMesh_);
+            staticWorldMeshKey_ = key;
+            return false;
+        }
         if (!uploadMesh(cpuMesh, staticWorldMesh_)) {
             return false;
         }
@@ -2786,12 +3716,97 @@ private:
             }
             const auto* texture = cachedTexture({}, prop.materialPath);
             drawMesh(commandBuffer, *mesh, texture, projectionView,
-                glm::translate(glm::mat4(1.0f), glm::vec3(prop.position.x, prop.position.y, prop.position.z)),
+                buildPropModelMatrix(prop),
                 worldViewport, worldScissor);
         }
-        // The previous box-built bot placeholder was useful for debugging,
-        // but it is visually distracting in the current art pass.
-        // Keep bot simulation active and wait for a real character asset.
+        const auto* playerMesh = cachedSourceMesh(renderFrame.playerCharacterModelPath);
+        const auto* playerTexture = cachedTexture(renderFrame.playerCharacterAlbedoPath, renderFrame.playerCharacterMaterialPath);
+        for (const auto& player : renderFrame.world->players()) {
+            if (player.id.empty() || player.id == renderFrame.localPlayerId) {
+                continue;
+            }
+
+            if (playerMesh != nullptr) {
+                float playerYaw = renderFrame.playerCharacterYawOffsetRadians;
+                const float horizontalSpeedSquared =
+                    player.velocity.x * player.velocity.x +
+                    player.velocity.z * player.velocity.z;
+                if (horizontalSpeedSquared > 0.0004f) {
+                    playerYaw += std::atan2(player.velocity.z, player.velocity.x);
+                }
+                const glm::mat4 playerModel =
+                    glm::translate(glm::mat4(1.0f), glm::vec3(player.position.x, player.position.y - 1.0f, player.position.z)) *
+                    glm::rotate(glm::mat4(1.0f), playerYaw, glm::vec3(0.0f, 1.0f, 0.0f)) *
+                    glm::scale(glm::mat4(1.0f), glm::vec3(renderFrame.playerCharacterScale));
+                drawMesh(commandBuffer, *playerMesh, playerTexture, projectionView, playerModel, worldViewport, worldScissor);
+            }
+
+            const util::Vec3 feetPoint{
+                player.position.x,
+                player.position.y - 1.0f,
+                player.position.z,
+            };
+            const util::Vec3 headPoint{
+                player.position.x,
+                player.position.y + 0.72f,
+                player.position.z,
+            };
+            const auto feetProjected = projectWorldPoint(projectionView, feetPoint, widthPx, heightPx);
+            const auto headProjected = projectWorldPoint(projectionView, headPoint, widthPx, heightPx);
+            if (!feetProjected.has_value() || !headProjected.has_value()) {
+                continue;
+            }
+
+            const float topY = std::min(feetProjected->y, headProjected->y);
+            const float bottomY = std::max(feetProjected->y, headProjected->y);
+            const float screenHeight = std::clamp(bottomY - topY, 18.0f, heightPx * 0.38f);
+            const float centerX = headProjected->x;
+            if (bottomY < -24.0f || topY > heightPx + 24.0f ||
+                centerX < -64.0f || centerX > widthPx + 64.0f) {
+                continue;
+            }
+
+            const util::Vec3 baseColor =
+                player.team == gameplay::Team::Attackers ? util::Vec3{0.88f, 0.38f, 0.22f}
+                : player.team == gameplay::Team::Defenders ? util::Vec3{0.24f, 0.54f, 0.92f}
+                                                           : util::Vec3{0.58f, 0.60f, 0.64f};
+            const util::Vec3 accentColor =
+                player.botControlled ? util::Vec3{0.98f, 0.88f, 0.42f}
+                                     : util::Vec3{0.96f, 0.97f, 0.98f};
+            const float bodyHalfWidth = std::clamp(screenHeight * 0.16f, 6.0f, 24.0f);
+            const float headHalfWidth = std::clamp(screenHeight * 0.10f, 5.0f, 14.0f);
+            const float headHeight = std::clamp(screenHeight * 0.16f, 8.0f, 18.0f);
+            const float bodyTop = topY + screenHeight * 0.22f;
+            const float bodyBottom = bodyTop + screenHeight * 0.66f;
+            const float headTop = topY + screenHeight * 0.04f;
+            const float headBottom = headTop + headHeight;
+            const float labelBaseline = std::max(18.0f, headTop - 8.0f);
+            const float healthRatio = std::clamp(player.health / 100.0f, 0.0f, 1.0f);
+            const float healthBarWidth = std::clamp(screenHeight * 0.52f, 20.0f, 64.0f);
+
+            if (playerMesh == nullptr) {
+                clearRect(dispatch_, commandBuffer, makeAttachment(0.05f, 0.07f, 0.09f),
+                    makePixelRect(swapchainExtent_, centerX - bodyHalfWidth - 2.0f, bodyTop - 2.0f,
+                        centerX + bodyHalfWidth + 2.0f, bodyBottom + 2.0f));
+                clearRect(dispatch_, commandBuffer, makeAttachment(baseColor, 0.95f),
+                    makePixelRect(swapchainExtent_, centerX - bodyHalfWidth, bodyTop,
+                        centerX + bodyHalfWidth, bodyBottom));
+                clearRect(dispatch_, commandBuffer, makeAttachment(0.04f, 0.05f, 0.07f),
+                    makePixelRect(swapchainExtent_, centerX - headHalfWidth - 2.0f, headTop - 2.0f,
+                        centerX + headHalfWidth + 2.0f, headBottom + 2.0f));
+                clearRect(dispatch_, commandBuffer, makeAttachment(accentColor, 0.92f),
+                    makePixelRect(swapchainExtent_, centerX - headHalfWidth, headTop,
+                        centerX + headHalfWidth, headBottom));
+            }
+            clearRect(dispatch_, commandBuffer, makeAttachment(0.12f, 0.15f, 0.18f),
+                makePixelRect(swapchainExtent_, centerX - healthBarWidth * 0.5f, labelBaseline - 10.0f,
+                    centerX + healthBarWidth * 0.5f, labelBaseline - 6.0f));
+            clearRect(dispatch_, commandBuffer, makeAttachment(baseColor, 1.10f),
+                makePixelRect(swapchainExtent_, centerX - healthBarWidth * 0.5f, labelBaseline - 10.0f,
+                    centerX - healthBarWidth * 0.5f + healthBarWidth * healthRatio, labelBaseline - 6.0f));
+            recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, makeAttachment(accentColor, 0.95f),
+                centerX, labelBaseline, widenUtf8(player.displayName), 0.28f, 0.02f);
+        }
 
         if (renderFrame.smokeOverlay > 0.0f) {
             clearRect(dispatch_, commandBuffer, makeAttachment(0.60f, 0.64f, 0.68f), makeRect(swapchainExtent_, 0.12f, 0.26f, 0.88f, 0.74f));
@@ -2838,6 +3853,25 @@ private:
             clearRect(dispatch_, commandBuffer, makeAttachment(profile.body),
                 makePixelRect(swapchainExtent_, iconX - 3.0f, iconY - 3.0f, iconX + 3.0f, iconY + 3.0f));
             clearRect(dispatch_, commandBuffer, makeAttachment(profile.accent),
+                makePixelRect(swapchainExtent_, iconX - 1.5f, iconY - 1.5f, iconX + 1.5f, iconY + 1.5f));
+        }
+        for (const auto& player : renderFrame.world->players()) {
+            if (player.id.empty() || player.id == renderFrame.localPlayerId) {
+                continue;
+            }
+
+            const auto baseColor =
+                player.team == gameplay::Team::Attackers ? makeAttachment(0.92f, 0.40f, 0.22f)
+                : player.team == gameplay::Team::Defenders ? makeAttachment(0.26f, 0.56f, 0.94f)
+                                                           : makeAttachment(0.66f, 0.68f, 0.70f);
+            const auto accentColor = player.botControlled
+                ? makeAttachment(0.98f, 0.89f, 0.48f)
+                : makeAttachment(0.96f, 0.97f, 0.98f);
+            const float iconX = minimapLeft + cellWidth * player.position.x;
+            const float iconY = minimapTop + cellHeight * player.position.z;
+            clearRect(dispatch_, commandBuffer, baseColor,
+                makePixelRect(swapchainExtent_, iconX - 4.0f, iconY - 4.0f, iconX + 4.0f, iconY + 4.0f));
+            clearRect(dispatch_, commandBuffer, accentColor,
                 makePixelRect(swapchainExtent_, iconX - 1.5f, iconY - 1.5f, iconX + 1.5f, iconY + 1.5f));
         }
 
@@ -2965,6 +3999,9 @@ private:
         textVertices_.clear();
         recordLayout(frame.commandBuffer, renderFrame);
         flushTextBatch(frame.commandBuffer);
+        if (imguiInitialized_) {
+            ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), frame.commandBuffer);
+        }
         dispatch_.vkCmdEndRenderPass(frame.commandBuffer);
         dispatch_.vkEndCommandBuffer(frame.commandBuffer);
     }
@@ -3119,200 +4156,269 @@ private:
         recordSinglePlayerGameplay(commandBuffer, renderFrame);
     }
 
-    void recordMultiPlayerLobby(const VkCommandBuffer commandBuffer, const RenderFrame& renderFrame) {
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.23f, 0.18f, 0.43f), makeRect(swapchainExtent_, 0.06f, 0.10f, 0.56f, 0.88f));
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.12f, 0.10f, 0.22f), makeRect(swapchainExtent_, 0.62f, 0.10f, 0.92f, 0.88f));
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.38f, 0.28f, 0.68f), makeRect(swapchainExtent_, 0.08f, 0.14f, 0.54f, 0.24f));
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.20f, 0.14f, 0.38f), makeRect(swapchainExtent_, 0.66f, 0.14f, 0.88f, 0.24f));
-
-        const float width = static_cast<float>(swapchainExtent_.width);
-        const float height = static_cast<float>(swapchainExtent_.height);
-        const auto titleColor = makeAttachment(0.96f, 0.95f, 0.99f);
-        const auto bodyColor = makeAttachment(0.84f, 0.82f, 0.95f);
-        const auto accentColor = makeAttachment(0.98f, 0.86f, 0.54f);
-        const auto mutedColor = makeAttachment(0.72f, 0.70f, 0.86f);
-
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, titleColor,
-            width * 0.10f, height * 0.18f, L"联机房间", 1.00f);
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, bodyColor,
-            width * 0.10f, height * 0.24f, widenUtf8("地图 " + renderFrame.multiplayerMapLabel), 0.42f, 0.04f);
-
-        struct LobbyLine {
-            const wchar_t* label;
-            std::wstring value;
-        };
-        std::array<LobbyLine, 4> lines{{
-            {L"会话模式", widenUtf8(renderFrame.multiplayerSessionTypeLabel)},
-            {L"端口", widenUtf8(renderFrame.multiplayerEndpointLabel)},
-            {L"房间人数", widenUtf8(std::to_string(renderFrame.multiplayerMaxPlayers))},
-            {L"启动会话", renderFrame.multiplayerSessionActive ? L"已启动" : L"按 Enter 启动"},
-        }};
-
-        for (std::size_t index = 0; index < lines.size(); ++index) {
-            const float top = 0.30f + static_cast<float>(index) * 0.12f;
-            const bool selected = index == renderFrame.multiplayerSelectedIndex;
-            clearRect(dispatch_, commandBuffer,
-                selected ? makeAttachment(0.28f, 0.52f, 0.78f) : makeAttachment(0.16f, 0.13f, 0.30f),
-                makeRect(swapchainExtent_, 0.10f, top, 0.52f, top + 0.09f));
-            clearRect(dispatch_, commandBuffer,
-                selected ? accentColor : makeAttachment(0.08f, 0.08f, 0.14f),
-                makeRect(swapchainExtent_, 0.10f, top, 0.11f, top + 0.09f));
-            recordBitmapText(dispatch_, commandBuffer, swapchainExtent_,
-                selected ? titleColor : bodyColor,
-                width * 0.13f, height * (top + 0.050f), lines[index].label, 0.46f, 0.04f);
-            recordBitmapText(dispatch_, commandBuffer, swapchainExtent_,
-                selected ? accentColor : mutedColor,
-                width * 0.30f, height * (top + 0.050f), lines[index].value, 0.42f, 0.04f);
-        }
-
-        std::ostringstream summary;
-        summary << "房间状态\n" << renderFrame.multiplayerStatusLabel << "\n\n";
-        summary << "当前地图\n" << renderFrame.multiplayerMapLabel << "\n\n";
-        summary << "基础网络\n";
-        summary << "- UDP transport\n";
-        summary << "- Host / Client 切换\n";
-        summary << "- 会话快照入口";
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, bodyColor,
-            width * 0.68f, height * 0.30f, widenUtf8(summary.str()), 0.40f, 0.04f, 1.08f);
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, mutedColor,
-            width * 0.68f, height * 0.74f,
-            L"W/S 选择项目  A/D 调整  Enter 启动或切换\nEsc 返回主菜单  重新进入联机模式可重新选图",
-            0.34f, 0.03f, 1.08f);
+    void recordMultiPlayerLobby(const VkCommandBuffer commandBuffer, const RenderFrame&) {
+        clearRect(dispatch_, commandBuffer, makeAttachment(0.11f, 0.09f, 0.18f), makeRect(swapchainExtent_, 0.00f, 0.00f, 1.00f, 1.00f));
+        clearRect(dispatch_, commandBuffer, makeAttachment(0.19f, 0.14f, 0.32f), makeRect(swapchainExtent_, 0.06f, 0.08f, 0.62f, 0.92f));
+        clearRect(dispatch_, commandBuffer, makeAttachment(0.08f, 0.07f, 0.14f), makeRect(swapchainExtent_, 0.66f, 0.08f, 0.96f, 0.92f));
+        clearRect(dispatch_, commandBuffer, makeAttachment(0.32f, 0.24f, 0.54f), makeRect(swapchainExtent_, 0.08f, 0.12f, 0.60f, 0.22f));
+        clearRect(dispatch_, commandBuffer, makeAttachment(0.20f, 0.16f, 0.36f), makeRect(swapchainExtent_, 0.70f, 0.12f, 0.92f, 0.26f));
     }
 
     void recordMapEditor(const VkCommandBuffer commandBuffer, const RenderFrame& renderFrame) {
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.40f, 0.24f, 0.10f), makeRect(swapchainExtent_, 0.06f, 0.10f, 0.24f, 0.86f));
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.15f, 0.11f, 0.08f), makeRect(swapchainExtent_, 0.26f, 0.10f, 0.94f, 0.86f));
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.20f, 0.15f, 0.10f), makeRect(swapchainExtent_, 0.30f, 0.10f, 0.92f, 0.86f));
+        if (renderFrame.editingMap == nullptr) {
+            return;
+        }
 
-        const float width = static_cast<float>(swapchainExtent_.width);
-        const float height = static_cast<float>(swapchainExtent_.height);
-        const float canvasLeft = width * 0.30f;
-        const float canvasTop = height * 0.10f;
-        const float canvasRight = width * 0.92f;
-        const float canvasBottom = height * 0.86f;
+        const auto& map = *renderFrame.editingMap;
+        const float widthPx = static_cast<float>(swapchainExtent_.width);
+        const float heightPx = static_cast<float>(swapchainExtent_.height);
+        const glm::mat4 projection = buildMapEditorProjectionMatrix(renderFrame, widthPx, heightPx);
+        const glm::mat4 view = buildMapEditorViewMatrix(renderFrame, map);
+        const glm::mat4 projectionView = projection * view;
+        const VkViewport viewport{0.0f, 0.0f, widthPx, heightPx, 0.0f, 1.0f};
+        const VkRect2D scissor{{0, 0}, swapchainExtent_};
 
-        int attackSpawnCount = 0;
-        int defendSpawnCount = 0;
-        if (renderFrame.editingMap != nullptr && renderFrame.editingMap->width > 0 && renderFrame.editingMap->depth > 0) {
-            const float cellWidth = (canvasRight - canvasLeft) / static_cast<float>(renderFrame.editingMap->width);
-            const float cellHeight = (canvasBottom - canvasTop) / static_cast<float>(renderFrame.editingMap->depth);
+        if (ensureStaticWorldMesh(map)) {
+            const auto* defaultTexture = ensureDefaultTexture() ? &defaultTexture_ : nullptr;
+            drawMesh(commandBuffer, staticWorldMesh_, defaultTexture, projectionView, glm::mat4(1.0f), viewport, scissor);
+        }
 
-            for (int z = 0; z < renderFrame.editingMap->depth; ++z) {
-                for (int x = 0; x < renderFrame.editingMap->width; ++x) {
-                    bool hasCover = false;
-                    bool hasSiteA = false;
-                    bool hasSiteB = false;
-                    for (const auto& block : renderFrame.editingMap->blocks) {
-                        if (block.cell.x != x || block.cell.z != z) {
-                            continue;
-                        }
-                        hasCover = hasCover || (block.solid && block.cell.y >= 1);
-                        hasSiteA = hasSiteA || block.materialId.find("site_a") != std::string::npos;
-                        hasSiteB = hasSiteB || block.materialId.find("site_b") != std::string::npos;
-                    }
-
-                    auto cellColor = makeAttachment(((x + z) % 2) == 0 ? 0.24f : 0.21f, ((x + z) % 2) == 0 ? 0.26f : 0.23f, 0.22f);
-                    if (hasSiteA) {
-                        cellColor = makeAttachment(0.56f, 0.22f, 0.16f);
-                    } else if (hasSiteB) {
-                        cellColor = makeAttachment(0.20f, 0.30f, 0.56f);
-                    } else if (hasCover) {
-                        cellColor = makeAttachment(0.48f, 0.44f, 0.40f);
-                    }
-
-                    const float left = canvasLeft + cellWidth * static_cast<float>(x) + 1.0f;
-                    const float top = canvasTop + cellHeight * static_cast<float>(z) + 1.0f;
-                    const float right = canvasLeft + cellWidth * static_cast<float>(x + 1) - 1.0f;
-                    const float bottom = canvasTop + cellHeight * static_cast<float>(z + 1) - 1.0f;
-                    clearRect(dispatch_, commandBuffer, cellColor, makePixelRect(swapchainExtent_, left, top, right, bottom));
-
-                    for (const auto& prop : renderFrame.editingMap->props) {
-                        if (static_cast<int>(std::floor(prop.position.x)) != x || static_cast<int>(std::floor(prop.position.z)) != z) {
-                            continue;
-                        }
-                        const bool isBarrel = toLowerAscii(prop.id + " " + prop.modelPath.generic_string()).find("barrel") != std::string::npos;
-                        clearRect(dispatch_, commandBuffer,
-                            isBarrel ? makeAttachment(0.72f, 0.42f, 0.28f) : makeAttachment(0.74f, 0.58f, 0.28f),
-                            makePixelRect(swapchainExtent_,
-                                left + cellWidth * 0.22f,
-                                top + cellHeight * 0.22f,
-                                right - cellWidth * 0.22f,
-                                bottom - cellHeight * 0.22f));
-                    }
-
-                    for (const auto& spawn : renderFrame.editingMap->spawns) {
-                        if (static_cast<int>(std::floor(spawn.position.x)) != x || static_cast<int>(std::floor(spawn.position.z)) != z) {
-                            continue;
-                        }
-                        if (spawn.team == gameplay::Team::Attackers) {
-                            ++attackSpawnCount;
-                            clearRect(dispatch_, commandBuffer, makeAttachment(0.22f, 0.78f, 0.44f),
-                                makePixelRect(swapchainExtent_, left + 4.0f, top + 4.0f, right - 4.0f, top + std::max(8.0f, cellHeight * 0.32f)));
-                        } else if (spawn.team == gameplay::Team::Defenders) {
-                            ++defendSpawnCount;
-                            clearRect(dispatch_, commandBuffer, makeAttachment(0.34f, 0.62f, 0.94f),
-                                makePixelRect(swapchainExtent_, left + 4.0f, bottom - std::max(8.0f, cellHeight * 0.32f), right - 4.0f, bottom - 4.0f));
-                        }
-                    }
-                }
+        for (const auto& prop : map.props) {
+            const auto* mesh = cachedSourceMesh(prop.modelPath);
+            if (mesh == nullptr) {
+                continue;
             }
-
-            const float cursorLeft = canvasLeft + cellWidth * static_cast<float>(std::clamp(renderFrame.editorCursorX, 0, renderFrame.editingMap->width - 1));
-            const float cursorTop = canvasTop + cellHeight * static_cast<float>(std::clamp(renderFrame.editorCursorZ, 0, renderFrame.editingMap->depth - 1));
-            const float cursorRight = cursorLeft + cellWidth;
-            const float cursorBottom = cursorTop + cellHeight;
-            clearRect(dispatch_, commandBuffer, makeAttachment(0.98f, 0.88f, 0.42f),
-                makePixelRect(swapchainExtent_, cursorLeft, cursorTop, cursorRight, cursorTop + 3.0f));
-            clearRect(dispatch_, commandBuffer, makeAttachment(0.98f, 0.88f, 0.42f),
-                makePixelRect(swapchainExtent_, cursorLeft, cursorBottom - 3.0f, cursorRight, cursorBottom));
-            clearRect(dispatch_, commandBuffer, makeAttachment(0.98f, 0.88f, 0.42f),
-                makePixelRect(swapchainExtent_, cursorLeft, cursorTop, cursorLeft + 3.0f, cursorBottom));
-            clearRect(dispatch_, commandBuffer, makeAttachment(0.98f, 0.88f, 0.42f),
-                makePixelRect(swapchainExtent_, cursorRight - 3.0f, cursorTop, cursorRight, cursorBottom));
+            const auto* texture = cachedTexture({}, prop.materialPath);
+            drawMesh(commandBuffer, *mesh, texture, projectionView, buildPropModelMatrix(prop), viewport, scissor);
         }
 
-        const auto titleColor = makeAttachment(0.98f, 0.94f, 0.86f);
-        const auto bodyColor = makeAttachment(0.92f, 0.84f, 0.70f);
-        const auto mutedColor = makeAttachment(0.84f, 0.78f, 0.70f);
-        const auto accentColor = makeAttachment(0.98f, 0.86f, 0.48f);
+        if (renderFrame.editorPlacementPreviewKind == RenderFrame::EditorPlacementPreviewKind::Prop) {
+            const auto* previewMesh = cachedSourceMesh(renderFrame.editorPlacementPreviewProp.modelPath);
+            if (previewMesh != nullptr) {
+                const auto* previewTexture = cachedTexture({}, renderFrame.editorPlacementPreviewProp.materialPath);
+                drawMesh(commandBuffer, *previewMesh, previewTexture, projectionView,
+                    buildPropModelMatrix(renderFrame.editorPlacementPreviewProp), viewport, scissor);
+            }
+        }
 
+        const auto drawSpawnMarker = [&](const gameplay::SpawnPoint& spawn,
+                                         const VkClearAttachment& fillColor,
+                                         const float radiusPx) {
+            const auto projected = projectWorldPoint(
+                projectionView,
+                {spawn.position.x, spawn.position.y + 0.25f, spawn.position.z},
+                widthPx,
+                heightPx);
+            if (!projected.has_value()) {
+                return;
+            }
+            clearRect(dispatch_, commandBuffer, fillColor,
+                makePixelRect(
+                    swapchainExtent_,
+                    projected->x - radiusPx,
+                    projected->y - radiusPx,
+                    projected->x + radiusPx,
+                    projected->y + radiusPx));
+            clearRect(dispatch_, commandBuffer, makeAttachment(0.98f, 0.95f, 0.90f),
+                makePixelRect(
+                    swapchainExtent_,
+                    projected->x - 1.5f,
+                    projected->y - radiusPx - 2.0f,
+                    projected->x + 1.5f,
+                    projected->y + radiusPx + 2.0f));
+            clearRect(dispatch_, commandBuffer, makeAttachment(0.98f, 0.95f, 0.90f),
+                makePixelRect(
+                    swapchainExtent_,
+                    projected->x - radiusPx - 2.0f,
+                    projected->y - 1.5f,
+                    projected->x + radiusPx + 2.0f,
+                    projected->y + 1.5f));
+        };
+
+        for (const auto& spawn : map.spawns) {
+            const int spawnIndex = static_cast<int>(&spawn - map.spawns.data());
+            const bool eraseHover = renderFrame.eraseEditorSpawnIndex == spawnIndex;
+            const bool hover = renderFrame.hoveredEditorSpawnIndex == spawnIndex;
+            const auto spawnColor = eraseHover
+                ? makeAttachment(0.96f, 0.36f, 0.26f)
+                : hover
+                    ? makeAttachment(0.99f, 0.83f, 0.42f)
+                    : (spawn.team == gameplay::Team::Attackers
+                        ? makeAttachment(0.22f, 0.82f, 0.48f)
+                        : makeAttachment(0.34f, 0.62f, 0.94f));
+            drawSpawnMarker(spawn, spawnColor, eraseHover || hover ? 7.0f : 5.0f);
+        }
+
+        if (renderFrame.editorPlacementPreviewKind == RenderFrame::EditorPlacementPreviewKind::Spawn) {
+            drawSpawnMarker(
+                renderFrame.editorPlacementPreviewSpawn,
+                renderFrame.editorPlacementPreviewSpawn.team == gameplay::Team::Attackers
+                    ? makeAttachment(0.92f, 0.78f, 0.30f)
+                    : makeAttachment(0.54f, 0.78f, 0.98f),
+                8.0f);
+        }
+
+        const auto drawOutlinedProp = [&](const int propIndex,
+                                          const VkClearAttachment& outlineColor,
+                                          const float thicknessPx,
+                                          const std::string& label) {
+            if (propIndex < 0 || propIndex >= static_cast<int>(map.props.size())) {
+                return;
+            }
+            float labelMinY = 0.0f;
+            float labelMidX = 0.0f;
+            if (recordPropOutline(
+                    dispatch_,
+                    commandBuffer,
+                    swapchainExtent_,
+                    projectionView,
+                    map.props[static_cast<std::size_t>(propIndex)],
+                    outlineColor,
+                    thicknessPx,
+                    &labelMinY,
+                    &labelMidX)) {
+                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, outlineColor,
+                    labelMidX, std::max(18.0f, labelMinY - 8.0f), widenUtf8(label), 0.28f, 0.02f);
+            }
+        };
+
+        if (renderFrame.selectedEditorPropIndex >= 0 &&
+            renderFrame.selectedEditorPropIndex != renderFrame.hoveredEditorPropIndex &&
+            renderFrame.selectedEditorPropIndex != renderFrame.eraseEditorPropIndex) {
+            drawOutlinedProp(
+                renderFrame.selectedEditorPropIndex,
+                makeAttachment(0.92f, 0.76f, 0.30f),
+                2.0f,
+                renderFrame.selectedEditorPropLabel);
+        }
+        if (renderFrame.hoveredEditorPropIndex >= 0) {
+            drawOutlinedProp(
+                renderFrame.hoveredEditorPropIndex,
+                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex
+                    ? makeAttachment(0.98f, 0.40f, 0.26f)
+                    : makeAttachment(0.99f, 0.88f, 0.46f),
+                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex ? 3.5f : 3.0f,
+                renderFrame.hoveredEditorPropIndex == renderFrame.selectedEditorPropIndex
+                    ? renderFrame.selectedEditorPropLabel
+                    : describeEditorPropLabel(map.props[static_cast<std::size_t>(renderFrame.hoveredEditorPropIndex)]));
+        }
+        if (renderFrame.editorPlacementPreviewKind == RenderFrame::EditorPlacementPreviewKind::Prop) {
+            float labelMinY = 0.0f;
+            float labelMidX = 0.0f;
+            if (recordPropOutline(
+                    dispatch_,
+                    commandBuffer,
+                    swapchainExtent_,
+                    projectionView,
+                    renderFrame.editorPlacementPreviewProp,
+                    makeAttachment(0.46f, 0.92f, 0.98f),
+                    2.5f,
+                    &labelMinY,
+                    &labelMidX)) {
+                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, makeAttachment(0.46f, 0.92f, 0.98f),
+                    labelMidX, std::max(18.0f, labelMinY - 8.0f), L"放置预览", 0.26f, 0.02f);
+            }
+        }
+
+        if (renderFrame.editorHasTarget) {
+            const util::Vec3 cursorWorld{
+                renderFrame.editorTargetPosition.x,
+                renderFrame.editorTargetPosition.y,
+                renderFrame.editorTargetPosition.z,
+            };
+            if (const auto projected = projectWorldPoint(projectionView, cursorWorld, widthPx, heightPx);
+                projected.has_value()) {
+                const auto cursorColor =
+                    renderFrame.editorToolLabel == "擦除"
+                        ? makeAttachment(0.98f, 0.42f, 0.28f)
+                        : renderFrame.editorToolLabel == "放置"
+                            ? (renderFrame.editorTargetOnSurface
+                                ? makeAttachment(0.46f, 0.92f, 0.98f)
+                                : makeAttachment(0.78f, 0.92f, 0.98f))
+                            : makeAttachment(0.99f, 0.90f, 0.50f);
+                clearRect(dispatch_, commandBuffer, cursorColor,
+                    makePixelRect(swapchainExtent_, projected->x - 8.0f, projected->y - 1.5f, projected->x + 8.0f, projected->y + 1.5f));
+                clearRect(dispatch_, commandBuffer, cursorColor,
+                    makePixelRect(swapchainExtent_, projected->x - 1.5f, projected->y - 8.0f, projected->x + 1.5f, projected->y + 8.0f));
+            }
+        }
+
+        if (!renderFrame.editorIsOrthoView && renderFrame.editorMouseLookActive) {
+            const float crossX = widthPx * 0.5f;
+            const float crossY = heightPx * 0.5f;
+            const auto crossColor = makeAttachment(0.98f, 0.95f, 0.80f);
+            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 11.0f, crossY - 1.0f, crossX - 3.0f, crossY + 1.0f));
+            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX + 3.0f, crossY - 1.0f, crossX + 11.0f, crossY + 1.0f));
+            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 1.0f, crossY - 11.0f, crossX + 1.0f, crossY - 3.0f));
+            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 1.0f, crossY + 3.0f, crossX + 1.0f, crossY + 11.0f));
+            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 1.5f, crossY - 1.5f, crossX + 1.5f, crossY + 1.5f));
+        }
+
+        clearRect(dispatch_, commandBuffer, makeAttachment(0.05f, 0.07f, 0.09f), makeRect(swapchainExtent_, 0.72f, 0.03f, 0.98f, 0.18f));
+        clearRect(dispatch_, commandBuffer, makeAttachment(0.05f, 0.07f, 0.09f), makeRect(swapchainExtent_, 0.18f, 0.90f, 0.98f, 0.98f));
+
+        const auto titleColor = makeAttachment(0.97f, 0.96f, 0.92f);
+        const auto bodyColor = makeAttachment(0.88f, 0.91f, 0.94f);
+        const auto accentColor = makeAttachment(0.99f, 0.87f, 0.46f);
+        const auto mutedColor = makeAttachment(0.74f, 0.80f, 0.84f);
+
+        std::ostringstream overlay;
+        overlay << "3D 地图编辑器\n";
+        overlay << map.name << "\n";
+        overlay << "工具 " << renderFrame.editorToolLabel << "\n";
+        overlay << "模式 " << renderFrame.editorPlacementKindLabel << "\n";
+        overlay << "视图 " << renderFrame.editorViewModeLabel << "\n";
+        overlay << "目标点 "
+                << static_cast<int>(renderFrame.editorTargetPosition.x * 10.0f) / 10.0f << ", "
+                << static_cast<int>(renderFrame.editorTargetPosition.y * 10.0f) / 10.0f << ", "
+                << static_cast<int>(renderFrame.editorTargetPosition.z * 10.0f) / 10.0f << "\n";
+        overlay << (renderFrame.editorTargetOnSurface ? "表面吸附" : "自由摆放") << "\n";
+        overlay << "相机 " << static_cast<int>(renderFrame.cameraPosition.x * 10.0f) / 10.0f
+                << ", " << static_cast<int>(renderFrame.cameraPosition.y * 10.0f) / 10.0f
+                << ", " << static_cast<int>(renderFrame.cameraPosition.z * 10.0f) / 10.0f << "\n";
+        overlay << "道具 " << renderFrame.editorPropCount << "  出生点 " << renderFrame.editorSpawnCount
+                << "  撤销 " << (renderFrame.editorUndoAvailable ? "可用" : "空");
         recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, titleColor,
-            width * 0.09f, height * 0.18f, L"地图编辑器", 1.06f);
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, bodyColor,
-            width * 0.09f, height * 0.27f, widenUtf8(renderFrame.editingMap != nullptr ? renderFrame.editingMap->name : "未加载地图"), 0.54f, 0.05f);
-        std::ostringstream mapCatalog;
-        mapCatalog << "地图文件\n" << renderFrame.editorMapFileLabel << "\n";
-        if (renderFrame.editorMapCount > 0) {
-            mapCatalog << "第 " << (renderFrame.editorMapIndex + 1) << " / " << renderFrame.editorMapCount << " 张";
+            widthPx * 0.74f, heightPx * 0.06f, widenUtf8(overlay.str()), 0.34f, 0.04f, 1.06f);
+
+        std::ostringstream selectionStatus;
+        if (renderFrame.hasSelectedEditorProp) {
+            selectionStatus << "选中 " << renderFrame.selectedEditorPropLabel << "\n";
+            selectionStatus << "位置 " << renderFrame.selectedEditorPropPosition.x << ", "
+                            << renderFrame.selectedEditorPropPosition.y << ", "
+                            << renderFrame.selectedEditorPropPosition.z << "\n";
+            selectionStatus << "旋转 " << renderFrame.selectedEditorPropRotationDegrees.x << ", "
+                            << renderFrame.selectedEditorPropRotationDegrees.y << ", "
+                            << renderFrame.selectedEditorPropRotationDegrees.z << "\n";
+            selectionStatus << "缩放 " << renderFrame.selectedEditorPropScale.x << ", "
+                            << renderFrame.selectedEditorPropScale.y << ", "
+                            << renderFrame.selectedEditorPropScale.z;
+        } else if (renderFrame.hoveredEditorSpawnIndex >= 0) {
+            selectionStatus << "悬停出生点\n";
+            selectionStatus << renderFrame.editorCellSpawnLabel << "\n";
+            selectionStatus << "可切换到擦除工具删除";
         } else {
-            mapCatalog << "暂无地图文件";
+            selectionStatus << "当前未锁定道具\n";
+            selectionStatus << "选择工具会自动锁定鼠标指中的对象";
         }
         recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, accentColor,
-            width * 0.09f, height * 0.77f, widenUtf8(mapCatalog.str()), 0.36f, 0.04f, 1.06f);
+            widthPx * 0.74f, heightPx * 0.20f, widenUtf8(selectionStatus.str()), 0.30f, 0.03f, 1.04f);
 
-        std::ostringstream toolList;
-        toolList << "当前工具\n" << renderFrame.editorToolLabel << "\n\n";
-        toolList << "快捷键\n";
-        toolList << "1 墙体\n2 箱体\n3 进攻出生点\n4 防守出生点\n5 擦除\nG 循环工具\nQ / E 切换地图\nF6 新建地图\nF5 / V 保存";
+        const std::wstring lookHint = renderFrame.editorIsOrthoView
+            ? L"正交规划视图"
+            : (renderFrame.editorMouseLookActive
+                ? L"环视中"
+                : L"鼠标指向编辑");
         recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, mutedColor,
-            width * 0.09f, height * 0.35f, widenUtf8(toolList.str()), 0.38f, 0.04f, 1.10f);
-
-        std::ostringstream stats;
-        if (renderFrame.editingMap != nullptr) {
-            stats << "地图尺寸 " << renderFrame.editingMap->width << " x " << renderFrame.editingMap->depth << "\n";
-            stats << "方块 " << renderFrame.editingMap->blocks.size() << "\n";
-            stats << "道具 " << renderFrame.editingMap->props.size() << "\n";
-            stats << "出生点 " << renderFrame.editingMap->spawns.size() << " 进攻 " << attackSpawnCount << " 防守 " << defendSpawnCount << "\n";
-        }
-        stats << "光标 (" << renderFrame.editorCursorX << ", " << renderFrame.editorCursorZ << ")\n";
-        stats << "状态 " << renderFrame.editorStatusLabel;
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, accentColor,
-            width * 0.32f, height * 0.18f, widenUtf8(stats.str()), 0.42f, 0.04f, 1.08f);
+            widthPx * 0.79f, heightPx * 0.33f, lookHint, 0.28f, 0.03f);
         recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, bodyColor,
-            width * 0.32f, height * 0.76f,
-            L"左键直接选格并应用工具  回车/空格应用当前工具  Delete 清除当前格  Q/E 切图  F6 新建  Esc 返回主菜单",
-            0.36f, 0.03f, 1.06f);
+            widthPx * 0.20f, heightPx * 0.935f,
+            renderFrame.editorIsOrthoView
+                ? L"WASD 平移  Space/Ctrl 缩放  1 选择  2 放置  3 擦除  G 放置类型  O 视图切换  Ctrl+Z 撤销"
+                : L"右键环视  鼠标悬停选择  1 选择  2 放置  3 擦除  G 放置类型  R 旋转  Tab 缩放  O 视图切换  Ctrl+Z 撤销",
+            0.29f, 0.03f);
+        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, accentColor,
+            widthPx * 0.20f, heightPx * 0.965f, widenUtf8(renderFrame.editorStatusLabel), 0.28f, 0.03f);
     }
 
     void recordSettings(const VkCommandBuffer commandBuffer, const RenderFrame& renderFrame) {
@@ -3398,6 +4504,7 @@ private:
     VkImage depthImage_ = VK_NULL_HANDLE;
     VmaAllocation depthAllocation_ = VK_NULL_HANDLE;
     VkImageView depthImageView_ = VK_NULL_HANDLE;
+    platform::IWindow* hostWindow_ = nullptr;
     VkDescriptorSetLayout textureDescriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool textureDescriptorPool_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
@@ -3413,6 +4520,9 @@ private:
     bool worldPrinted_ = false;
     bool editorPrinted_ = false;
     bool bitmapUiLogged_ = false;
+    bool imguiInitialized_ = false;
+    bool imguiKeyboardCapture_ = false;
+    bool imguiMouseCapture_ = false;
     GpuBuffer staticWorldMesh_{};
     TextureResource defaultTexture_{};
     TextureResource uiFontAtlasTexture_{};
@@ -3423,6 +4533,12 @@ private:
     std::vector<CachedPreviewMesh> previewMeshCache_{};
     std::vector<UiFontGlyphPlacement> uiFontGlyphPlacements_{};
     std::vector<TextVertex> textVertices_{};
+    std::vector<UiAction> pendingUiActions_{};
+    std::array<char, 128> multiplayerHostDraft_{};
+    int multiplayerSessionTypeDraft_ = 0;
+    int multiplayerPortDraft_ = 37015;
+    int multiplayerMaxPlayersDraft_ = 10;
+    bool multiplayerDraftInitialized_ = false;
 };
 
 #else
@@ -3459,6 +4575,18 @@ public:
             spdlog::info("[MainMenu] {}", frame.mainMenu->title());
             menuPrinted_ = true;
         }
+    }
+
+    bool wantsKeyboardCapture() const override {
+        return false;
+    }
+
+    bool wantsMouseCapture() const override {
+        return false;
+    }
+
+    std::vector<UiAction> consumeUiActions() override {
+        return {};
     }
 
     void shutdown() override {

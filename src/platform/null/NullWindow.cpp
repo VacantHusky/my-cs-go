@@ -19,6 +19,7 @@ public:
     int clientWidth() const override { return 1600; }
     int clientHeight() const override { return 900; }
     void setRelativeMouseMode(bool) override {}
+    void setNativeEventObserver(NativeEventObserver) override {}
 
 private:
     mutable int frameCount_ = 0;

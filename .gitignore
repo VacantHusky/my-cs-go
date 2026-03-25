@@ -16,6 +16,7 @@ settings.cfg
 *.log
 
 *.obj
+!assets/source/**/*.obj
 *.o
 *.a
 *.lib
@@ -27,3 +28,7 @@ settings.cfg
 
 assets/generated/*
 !assets/generated/.gitkeep
+
+__pycache__/
+*.zip
+*:Zone.Identifier

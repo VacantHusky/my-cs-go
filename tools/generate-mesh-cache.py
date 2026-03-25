@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -16,6 +17,13 @@ SOURCE_ROOT = ASSET_ROOT / "source"
 CACHE_ROOT = ASSET_ROOT / "generated" / "mesh_cache"
 MESH_MAGIC = 0x314D4353
 MESH_VERSION = 2
+GLB_MAGIC = 0x46546C67
+GLB_VERSION = 2
+GLB_JSON_CHUNK = 0x4E4F534A
+GLB_BIN_CHUNK = 0x004E4942
+FORCE_SOURCE_LOADED_MESHES = {
+    "source/itchio/metro_psx/Models/Metro.glb",
+}
 
 
 def sanitize_path_key(value: str) -> str:
@@ -192,6 +200,7 @@ def accessor_components(accessor_type: str) -> int:
 
 def component_struct(component_type: int) -> Tuple[str, int]:
     mapping = {
+        5121: ("B", 1),
         5123: ("H", 2),
         5125: ("I", 4),
         5126: ("f", 4),
@@ -230,10 +239,52 @@ def apply_node_transform(position: Sequence[float], translation: Sequence[float]
     )
 
 
-def build_gltf_mesh(source_path: Path) -> List[Tuple[float, ...]]:
+def load_buffer_from_uri(source_path: Path, uri: str) -> bytes:
+    if uri.startswith("data:"):
+        header, separator, payload = uri.partition(",")
+        if not separator or ";base64" not in header:
+            raise ValueError(f"Unsupported data URI buffer in {source_path}")
+        return base64.b64decode(payload)
+    return (source_path.parent / uri).read_bytes()
+
+
+def load_gltf_payload(source_path: Path) -> Tuple[dict, bytes]:
+    if source_path.suffix.lower() == ".glb":
+        raw = source_path.read_bytes()
+        if len(raw) < 12:
+            raise ValueError(f"Invalid GLB header in {source_path}")
+        magic, version, total_length = struct.unpack_from("<III", raw, 0)
+        if magic != GLB_MAGIC or version != GLB_VERSION or total_length > len(raw):
+            raise ValueError(f"Invalid GLB file in {source_path}")
+
+        json_chunk = b""
+        binary_chunk = b""
+        offset = 12
+        while offset + 8 <= total_length:
+            chunk_length, chunk_type = struct.unpack_from("<II", raw, offset)
+            offset += 8
+            chunk_data = raw[offset:offset + chunk_length]
+            if len(chunk_data) != chunk_length:
+                raise ValueError(f"Truncated GLB chunk in {source_path}")
+            offset += chunk_length
+            if chunk_type == GLB_JSON_CHUNK and not json_chunk:
+                json_chunk = chunk_data.rstrip(b" \t\r\n\0")
+            elif chunk_type == GLB_BIN_CHUNK and not binary_chunk:
+                binary_chunk = chunk_data
+
+        if not json_chunk:
+            raise ValueError(f"GLB JSON chunk missing in {source_path}")
+        return json.loads(json_chunk.decode("utf-8")), binary_chunk
+
     gltf = json.loads(source_path.read_text(encoding="utf-8"))
-    buffer_uri = gltf["buffers"][0]["uri"]
-    binary = (source_path.parent / buffer_uri).read_bytes()
+    buffer_uri = gltf["buffers"][0].get("uri", "")
+    if not buffer_uri:
+        raise ValueError(f"External glTF buffer URI missing in {source_path}")
+    return gltf, load_buffer_from_uri(source_path, buffer_uri)
+
+
+def build_gltf_mesh(source_path: Path) -> List[Tuple[float, ...]]:
+    gltf, binary = load_gltf_payload(source_path)
     scene = gltf["scenes"][gltf.get("scene", 0)]
     nodes = gltf["nodes"]
     meshes = gltf["meshes"]
@@ -277,14 +328,25 @@ def build_gltf_mesh(source_path: Path) -> List[Tuple[float, ...]]:
 
 
 def collect_sources() -> Iterable[Path]:
-    for extension in ("*.obj", "*.gltf"):
+    for extension in ("*.obj", "*.gltf", "*.glb"):
         yield from SOURCE_ROOT.rglob(extension)
+
+
+def should_skip_cache(source_path: Path) -> bool:
+    try:
+        relative = source_path.relative_to(ASSET_ROOT).as_posix()
+    except ValueError:
+        relative = source_path.as_posix()
+    return relative in FORCE_SOURCE_LOADED_MESHES
 
 
 def main() -> int:
     generated = 0
     for source_path in sorted(collect_sources()):
         if source_path.name.endswith(":Zone.Identifier"):
+            continue
+        if should_skip_cache(source_path):
+            cache_path_for(source_path).unlink(missing_ok=True)
             continue
         if source_path.suffix.lower() == ".obj":
             vertices = build_obj_mesh(source_path)

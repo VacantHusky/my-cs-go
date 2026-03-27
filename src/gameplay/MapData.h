@@ -26,6 +26,12 @@ struct MapProp {
     util::Vec3 position;
     std::filesystem::path modelPath;
     std::filesystem::path materialPath;
+    std::string label;
+    std::string category;
+    util::Vec3 collisionHalfExtents{0.42f, 0.52f, 0.42f};
+    util::Vec3 collisionCenterOffset{0.0f, 0.52f, 0.0f};
+    util::ColorRgb8 previewColor{160, 164, 170};
+    bool cylindricalFootprint = false;
     util::Vec3 rotationDegrees{};
     util::Vec3 scale{1.0f, 1.0f, 1.0f};
 };
@@ -63,7 +69,10 @@ public:
 
     void paintFloor(int y, const std::string& materialId);
     void paintPerimeterWalls(int wallHeight, const std::string& materialId);
-    void addCrate(const util::Vec3& position, const std::filesystem::path& modelPath, const std::filesystem::path& materialPath);
+    void addObject(const std::string& objectId,
+                   const util::Vec3& position,
+                   const std::filesystem::path& modelPath,
+                   const std::filesystem::path& materialPath);
     void addSpawn(Team team, const util::Vec3& position);
     bool exportTopDownPreview(const std::filesystem::path& path) const;
 

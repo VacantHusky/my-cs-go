@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app/MainMenu.h"
+#include "content/ObjectCatalog.h"
 #include "gameplay/MapData.h"
 #include "gameplay/Simulation.h"
 #include "util/MathTypes.h"
@@ -86,11 +87,34 @@ struct RenderFrame {
     bool editorMouseLookActive = false;
     bool editorIsOrthoView = false;
     float editorOrthoSpan = 0.0f;
+    bool editorShowMeshOutline = true;
+    bool editorShowCollisionOutline = true;
+    bool editorShowBoundingBox = false;
     bool editorUndoAvailable = false;
     std::size_t editorMapIndex = 0;
     std::size_t editorMapCount = 0;
-    std::string editorWallMaterialLabel;
-    std::string editorPropPresetLabel;
+    std::string editorAssetManifestLabel;
+    int editorObjectAssetCount = 0;
+    int editorObjectCategoryCount = 0;
+    const std::vector<content::ObjectAssetDefinition>* editorObjectAssets = nullptr;
+    std::size_t editorSelectedObjectAssetIndex = 0;
+    std::string editorSelectedObjectAssetLabel;
+    std::size_t editorManagedObjectAssetIndex = 0;
+    bool editorHasManagedObjectAsset = false;
+    std::string editorManagedObjectAssetId;
+    std::string editorManagedObjectAssetLabel;
+    std::string editorManagedObjectAssetCategory;
+    std::string editorManagedObjectModelPath;
+    std::string editorManagedObjectMaterialPath;
+    std::string editorManagedObjectTags;
+    util::Vec3 editorManagedObjectCollisionHalfExtents{};
+    util::Vec3 editorManagedObjectCollisionCenterOffset{};
+    util::Vec3 editorManagedObjectPreviewColor{};
+    int editorManagedObjectPlacementKind = 0;
+    int editorManagedObjectActiveMapRefCount = 0;
+    int editorManagedObjectStoredMapRefCount = 0;
+    bool editorManagedObjectCylindrical = false;
+    bool editorManagedObjectEditorVisible = true;
     std::string editorCellFloorLabel;
     std::string editorCellCoverLabel;
     std::string editorCellPropLabel;
@@ -107,6 +131,8 @@ struct RenderFrame {
     int selectedEditorPropIndex = -1;
     bool hasSelectedEditorProp = false;
     std::string selectedEditorPropLabel;
+    std::string selectedEditorPropAssetId;
+    std::string selectedEditorPropCategoryLabel;
     std::string selectedEditorPropModelLabel;
     std::string selectedEditorPropMaterialLabel;
     util::Vec3 selectedEditorPropPosition{};
@@ -137,9 +163,27 @@ enum class UiActionType {
     CreateMapBrowserMap,
     SelectMapEditorTool,
     SelectMapEditorPlacementKind,
-    SelectEditorWallMaterial,
-    SelectEditorPropPreset,
+    SelectEditorObjectAsset,
+    SelectManagedObjectAsset,
+    CreateManagedObjectAsset,
+    DeleteManagedObjectAsset,
+    SaveManagedObjectAsset,
+    SetManagedObjectAssetId,
+    SetManagedObjectAssetLabel,
+    SetManagedObjectAssetCategory,
+    SetManagedObjectAssetModelPath,
+    SetManagedObjectAssetMaterialPath,
+    SetManagedObjectAssetTags,
+    SetManagedObjectAssetPlacementKind,
+    SetManagedObjectAssetCollisionHalfExtents,
+    SetManagedObjectAssetCollisionCenterOffset,
+    SetManagedObjectAssetPreviewColor,
+    ToggleManagedObjectAssetCylindrical,
+    ToggleManagedObjectAssetEditorVisible,
     ToggleMapEditorProjection,
+    ToggleMapEditorMeshOutline,
+    ToggleMapEditorCollisionOutline,
+    ToggleMapEditorBoundingBox,
     UndoMapEditorChange,
     SetSelectedEditorPropPosition,
     SetSelectedEditorPropRotation,

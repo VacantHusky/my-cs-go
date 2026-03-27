@@ -1,5 +1,9 @@
 #pragma once
 
+#include "content/AssetManifest.h"
+#include "content/ObjectCatalog.h"
+#include "gameplay/MapData.h"
+
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -76,18 +80,37 @@ public:
     const std::vector<WeaponDefinition>& weapons() const { return weapons_; }
     const std::vector<MaterialProfile>& materials() const { return materials_; }
     const std::vector<CharacterDefinition>& characters() const { return characters_; }
+    const AssetManifest& assetManifest() const { return assetManifest_; }
+    const ObjectCatalog& objectCatalog() const { return objectCatalog_; }
+    const std::vector<ObjectAssetDefinition>& objectAssets() const { return objectCatalog_.objects; }
+    const std::vector<AssetManifestEntry>& editorModels() const { return assetManifest_.editorModels; }
+    const std::vector<MaterialAssetEntry>& editorMaterials() const { return assetManifest_.editorMaterials; }
     const CharacterDefinition* findCharacter(std::string_view id) const;
+    const ObjectAssetDefinition* findObjectAsset(std::string_view id) const;
     const CharacterDefinition* defaultCharacter() const;
+    gameplay::MapProp instantiateMapProp(std::string_view objectId,
+                                         const util::Vec3& position,
+                                         const util::Vec3& rotationDegrees = {},
+                                         const util::Vec3& scale = {1.0f, 1.0f, 1.0f}) const;
+    bool resolveMapProp(gameplay::MapProp& prop) const;
+    void resolveMapData(gameplay::MapData& map) const;
+    bool upsertObjectAsset(ObjectAssetDefinition definition);
+    bool removeObjectAsset(std::string_view id);
 
 private:
     void createPlaceholderAssets(const std::filesystem::path& assetRoot);
     void createMaterialProfiles(const std::filesystem::path& assetRoot);
     void createWeaponCatalog(const std::filesystem::path& assetRoot);
     void createCharacterCatalog(const std::filesystem::path& assetRoot);
+    void createObjectCatalog(const std::filesystem::path& assetRoot);
+    bool persistObjectCatalog() const;
 
+    std::filesystem::path assetRoot_;
     std::vector<WeaponDefinition> weapons_;
     std::vector<MaterialProfile> materials_;
     std::vector<CharacterDefinition> characters_;
+    AssetManifest assetManifest_{};
+    ObjectCatalog objectCatalog_{};
 };
 
 }  // namespace mycsg::content

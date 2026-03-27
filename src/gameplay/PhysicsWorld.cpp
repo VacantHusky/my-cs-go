@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -61,6 +62,13 @@ constexpr float kWalkStairsStepUp = 0.46f;
 constexpr float kWalkStairsMinForward = 0.04f;
 constexpr float kWalkStairsForwardTest = 0.26f;
 constexpr float kWalkStairsStepDownExtra = 0.18f;
+
+std::string toLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
 
 namespace Layers {
 constexpr ObjectLayer NON_MOVING = 0;
@@ -311,23 +319,21 @@ RefConst<Shape> makeMeshShapeFromCpuMesh(const renderer::vulkan::CpuMesh& cpuMes
 }
 
 RefConst<Shape> makePropFallbackShape(const MapProp& prop, util::Vec3& outCenterOffset) {
-    const std::string key = prop.id + " " + prop.modelPath.generic_string();
-    if (key.find("barrel") != std::string::npos) {
-        outCenterOffset = {0.0f, 0.48f, 0.0f};
-        return new CylinderShape(0.48f, 0.28f);
+    if (prop.cylindricalFootprint) {
+        outCenterOffset = prop.collisionCenterOffset;
+        const float halfHeight = std::max(0.05f, prop.collisionHalfExtents.y - 0.06f);
+        const float radius = std::max(0.05f, std::max(prop.collisionHalfExtents.x, prop.collisionHalfExtents.z) - 0.06f);
+        return new CylinderShape(halfHeight, radius);
     }
-    if (key.find("crate") != std::string::npos) {
-        outCenterOffset = {0.0f, 0.42f, 0.0f};
-        return new BoxShape(Vec3(0.42f, 0.42f, 0.42f));
-    }
-    outCenterOffset = {0.0f, 0.50f, 0.0f};
-    return new BoxShape(Vec3(0.34f, 0.50f, 0.34f));
+    outCenterOffset = prop.collisionCenterOffset;
+    return new BoxShape(Vec3(
+        std::max(0.05f, prop.collisionHalfExtents.x),
+        std::max(0.05f, prop.collisionHalfExtents.y),
+        std::max(0.05f, prop.collisionHalfExtents.z)));
 }
 
 bool prefersPrimitivePropCollision(const MapProp& prop) {
-    const std::string key = prop.id + " " + prop.modelPath.generic_string();
-    return key.find("crate") != std::string::npos ||
-           key.find("barrel") != std::string::npos;
+    return prop.cylindricalFootprint || toLowerAscii(prop.id).find("crate") != std::string::npos;
 }
 
 RefConst<Shape> makePropShape(const std::filesystem::path& assetRoot,

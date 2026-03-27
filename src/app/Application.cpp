@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <set>
 #include <thread>
 
 namespace mycsg::app {
@@ -85,44 +86,10 @@ float trainingBaseSpread(const content::WeaponDefinition& weapon) {
 constexpr std::size_t kSettingsEntryCount = 4;
 constexpr std::size_t kMultiplayerEntryCount = 4;
 
-struct EditorWallMaterialPreset {
-    const char* id;
-    const char* label;
-};
-
-struct EditorPropPreset {
-    const char* id;
-    const char* label;
-    const char* modelRelativePath;
-    const char* materialRelativePath;
-};
-
 struct EditorPropScalePreset {
     float uniformScale;
     const char* label;
 };
-
-constexpr std::array<EditorWallMaterialPreset, 4> kEditorWallMaterialPresets{{
-    {"wall_cover", "战术掩体"},
-    {"wall_concrete", "混凝土墙"},
-    {"bomb_site_a", "A 点红色标记"},
-    {"bomb_site_b", "B 点蓝色标记"},
-}};
-
-constexpr std::array<EditorPropPreset, 2> kEditorPropPresets{{
-    {
-        "editor_crate",
-        "木箱",
-        "source/polyhaven/models/wooden_crate_02/wooden_crate_02_1k.gltf",
-        "generated/materials/polyhaven_wooden_crate_02.mat",
-    },
-    {
-        "barrel_02",
-        "金属油桶",
-        "source/polyhaven/models/Barrel_02/Barrel_02_1k.gltf",
-        "generated/materials/polyhaven_barrel_02.mat",
-    },
-}};
 
 constexpr std::array<EditorPropScalePreset, 5> kEditorPropScalePresets{{
     {0.75f, "0.75x"},
@@ -136,34 +103,8 @@ const char* settingToggleLabel(const bool enabled) {
     return enabled ? "开启" : "关闭";
 }
 
-const EditorWallMaterialPreset& editorWallMaterialPreset(const std::size_t index) {
-    return kEditorWallMaterialPresets[std::min(index, kEditorWallMaterialPresets.size() - 1)];
-}
-
-const EditorPropPreset& editorPropPreset(const std::size_t index) {
-    return kEditorPropPresets[std::min(index, kEditorPropPresets.size() - 1)];
-}
-
 const EditorPropScalePreset& editorPropScalePreset(const std::size_t index) {
     return kEditorPropScalePresets[std::min(index, kEditorPropScalePresets.size() - 1)];
-}
-
-std::filesystem::path editorBrushModelRelativePath() {
-    return "generated/models/crate.obj";
-}
-
-std::filesystem::path editorFloorMaterialRelativePath() {
-    return "generated/materials/polyhaven_concrete_floor.mat";
-}
-
-std::filesystem::path editorWallMaterialRelativePath(const std::string_view materialId) {
-    if (materialId == "bomb_site_a") {
-        return "generated/materials/bomb_site_a.mat";
-    }
-    if (materialId == "bomb_site_b") {
-        return "generated/materials/bomb_site_b.mat";
-    }
-    return "generated/materials/polyhaven_concrete_wall_006.mat";
 }
 
 const char* sessionTypeLabel(const network::SessionType type) {
@@ -293,13 +234,6 @@ std::string throwableLabel(const std::size_t index) {
     }
 }
 
-std::string lowerAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char character) {
-        return static_cast<char>(std::tolower(character));
-    });
-    return value;
-}
-
 std::string trimAscii(std::string value) {
     const auto isSpace = [](const unsigned char character) {
         return std::isspace(character) != 0;
@@ -343,24 +277,13 @@ std::string makeSessionLocalPlayerId(const network::SessionType type, const std:
 }
 
 std::string propDisplayLabel(const gameplay::MapProp& prop) {
-    const std::string key = lowerAscii(prop.id + " " + prop.modelPath.generic_string());
-    if (key.find("editor_brush_floor") != std::string::npos) {
-        return "地面盒体";
-    }
-    if (key.find("editor_brush_perimeter") != std::string::npos) {
-        return "边界墙";
-    }
-    if (key.find("editor_brush_wall") != std::string::npos) {
-        return "盒体墙";
-    }
-    if (key.find("barrel") != std::string::npos) {
-        return "金属油桶";
-    }
-    if (key.find("crate") != std::string::npos) {
-        return "木箱";
+    if (!prop.label.empty()) {
+        return prop.label;
     }
     return prop.id.empty() ? "道具" : prop.id;
 }
+
+util::Vec3 editorPropHalfExtents(const gameplay::MapProp& prop);
 
 util::Vec3 centerOfCell(const int cellX, const int cellZ, const float y = 0.0f) {
     return {static_cast<float>(cellX) + 0.5f, y, static_cast<float>(cellZ) + 0.5f};
@@ -372,31 +295,14 @@ bool positionInsideCell(const util::Vec3& position, const int cellX, const int c
 }
 
 bool pointHitsPropFootprint(const gameplay::MapProp& prop, const float x, const float z) {
-    const std::string key = lowerAscii(prop.id + " " + prop.modelPath.generic_string());
-    const util::Vec3 scale{
-        std::max(0.05f, std::abs(prop.scale.x)),
-        std::max(0.05f, std::abs(prop.scale.y)),
-        std::max(0.05f, std::abs(prop.scale.z)),
-    };
-    const float dx = std::abs(x - prop.position.x);
-    const float dz = std::abs(z - prop.position.z);
-
-    if (key.find("editor_brush") != std::string::npos ||
-        lowerAscii(prop.modelPath.filename().string()) == "crate.obj") {
-        return dx <= scale.x * 0.5f && dz <= scale.z * 0.5f;
+    const util::Vec3 halfExtents = editorPropHalfExtents(prop);
+    const float dx = x - prop.position.x;
+    const float dz = z - prop.position.z;
+    if (prop.cylindricalFootprint) {
+        const float radius = std::max(halfExtents.x, halfExtents.z);
+        return dx * dx + dz * dz <= radius * radius;
     }
-
-    if (key.find("barrel") != std::string::npos) {
-        const float barrelRadius = 0.30f * std::max(scale.x, scale.z);
-        return dx * dx + dz * dz <= barrelRadius * barrelRadius;
-    }
-
-    if (key.find("crate") != std::string::npos) {
-        return dx <= 0.48f * scale.x && dz <= 0.48f * scale.z;
-    }
-
-    constexpr float kGenericHalfExtent = 0.42f;
-    return dx <= kGenericHalfExtent * scale.x && dz <= kGenericHalfExtent * scale.z;
+    return std::abs(dx) <= halfExtents.x && std::abs(dz) <= halfExtents.z;
 }
 
 std::string pathDisplayLabel(const std::filesystem::path& path) {
@@ -419,38 +325,11 @@ util::Vec3 sanitizeEditorPropScale(const util::Vec3& scale) {
 }
 
 util::Vec3 editorPropHalfExtents(const gameplay::MapProp& prop) {
-    const std::string key = lowerAscii(prop.id + " " + prop.modelPath.generic_string());
     const util::Vec3 scale = sanitizeEditorPropScale(prop.scale);
-
-    if (key.find("editor_brush") != std::string::npos ||
-        lowerAscii(prop.modelPath.filename().string()) == "crate.obj") {
-        return {
-            0.5f * scale.x,
-            0.5f * scale.y,
-            0.5f * scale.z,
-        };
-    }
-
-    if (key.find("barrel") != std::string::npos) {
-        return {
-            0.34f * scale.x,
-            0.55f * scale.y,
-            0.34f * scale.z,
-        };
-    }
-
-    if (key.find("crate") != std::string::npos) {
-        return {
-            0.48f * scale.x,
-            0.48f * scale.y,
-            0.48f * scale.z,
-        };
-    }
-
     return {
-        0.42f * scale.x,
-        0.52f * scale.y,
-        0.42f * scale.z,
+        std::max(0.01f, prop.collisionHalfExtents.x) * scale.x,
+        std::max(0.01f, prop.collisionHalfExtents.y) * scale.y,
+        std::max(0.01f, prop.collisionHalfExtents.z) * scale.z,
     };
 }
 
@@ -851,6 +730,7 @@ bool Application::initialize() {
     bootstrapProjectFiles();
     spdlog::info("[Init] 正在创建默认场景...");
     activeMap_ = gameplay::makeDefaultBombDefusalMap(assetRoot_);
+    contentDatabase_.resolveMapData(activeMap_);
     spdlog::info("[Init] 场景创建完毕: {} ({}x{})", activeMap_.name, activeMap_.width, activeMap_.depth);
 
     spdlog::info("[Init] 正在创建离线模拟世界...");
@@ -892,8 +772,13 @@ bool Application::initialize() {
         return false;
     }
 
-    spdlog::info("Loaded {} weapons and {} material profiles.",
-        contentDatabase_.weapons().size(), contentDatabase_.materials().size());
+    spdlog::info("Loaded {} weapons, {} material profiles, {} selectable models ({} archived), {} textures and {} selectable materials.",
+        contentDatabase_.weapons().size(),
+        contentDatabase_.materials().size(),
+        contentDatabase_.assetManifest().editorModels.size(),
+        contentDatabase_.assetManifest().models.size() - contentDatabase_.assetManifest().editorModels.size(),
+        contentDatabase_.assetManifest().textures.size(),
+        contentDatabase_.assetManifest().editorMaterials.size());
     initializeLaunchFlow();
     refreshWindowTitle();
     logCurrentFlow();
@@ -1057,6 +942,29 @@ void Application::tick(const float deltaSeconds) {
         currentFlow_ == AppFlow::MapEditor ? mapEditorCameraPitchRadians_ : singlePlayerCameraPitchRadians_;
 
     const content::CharacterDefinition* playerCharacter = contentDatabase_.defaultCharacter();
+    const content::ObjectAssetDefinition* selectedEditorObjectAsset = selectedMapEditorObjectAsset();
+    const content::ObjectAssetDefinition* managedObjectAsset = selectedManagedObjectAsset();
+    const std::vector<const content::ObjectAssetDefinition*> selectableEditorObjects = mapEditorSelectableObjects();
+    std::set<std::string> selectableEditorCategories;
+    for (const auto* object : selectableEditorObjects) {
+        if (object != nullptr) {
+            selectableEditorCategories.insert(object->category);
+        }
+    }
+    const auto joinManagedTags = [](const std::vector<std::string>& tags) {
+        std::ostringstream out;
+        for (std::size_t index = 0; index < tags.size(); ++index) {
+            if (index > 0) {
+                out << ", ";
+            }
+            out << tags[index];
+        }
+        return out.str();
+    };
+    const int managedObjectActiveMapRefCount =
+        managedObjectAsset != nullptr ? countObjectAssetReferencesInMap(activeMap_, managedObjectAsset->id) : 0;
+    const int managedObjectStoredMapRefCount =
+        managedObjectAsset != nullptr ? countObjectAssetReferencesInStoredMaps(managedObjectAsset->id) : 0;
 
     renderer::RenderFrame frame{
         .appFlow = currentFlow_,
@@ -1114,11 +1022,41 @@ void Application::tick(const float deltaSeconds) {
         .editorMouseLookActive = mapEditorMouseLookActive_,
         .editorIsOrthoView = mapEditorViewMode_ == MapEditorViewMode::Ortho25D,
         .editorOrthoSpan = mapEditorOrthoSpan_,
+        .editorShowMeshOutline = mapEditorShowMeshOutline_,
+        .editorShowCollisionOutline = mapEditorShowCollisionOutline_,
+        .editorShowBoundingBox = mapEditorShowBoundingBox_,
         .editorUndoAvailable = !mapEditorUndoStack_.empty(),
         .editorMapIndex = activeMapCatalogIndex_,
         .editorMapCount = mapCatalogPaths_.size(),
-        .editorWallMaterialLabel = editorWallMaterialPreset(editorWallMaterialIndex_).label,
-        .editorPropPresetLabel = editorPropPreset(editorPropPresetIndex_).label,
+        .editorAssetManifestLabel = contentDatabase_.objectCatalog().catalogPath.generic_string(),
+        .editorObjectAssetCount = static_cast<int>(selectableEditorObjects.size()),
+        .editorObjectCategoryCount = static_cast<int>(selectableEditorCategories.size()),
+        .editorObjectAssets = &contentDatabase_.objectAssets(),
+        .editorSelectedObjectAssetIndex = editorObjectAssetIndex_,
+        .editorSelectedObjectAssetLabel = selectedEditorObjectAsset != nullptr ? selectedEditorObjectAsset->label : "无可用对象",
+        .editorManagedObjectAssetIndex = managedObjectAssetIndex_,
+        .editorHasManagedObjectAsset = managedObjectAsset != nullptr,
+        .editorManagedObjectAssetId = managedObjectAsset != nullptr ? managedObjectAsset->id : std::string{},
+        .editorManagedObjectAssetLabel = managedObjectAsset != nullptr ? managedObjectAsset->label : std::string{},
+        .editorManagedObjectAssetCategory = managedObjectAsset != nullptr ? managedObjectAsset->category : std::string{},
+        .editorManagedObjectModelPath = managedObjectAsset != nullptr ? managedObjectAsset->modelPath.generic_string() : std::string{},
+        .editorManagedObjectMaterialPath = managedObjectAsset != nullptr ? managedObjectAsset->materialPath.generic_string() : std::string{},
+        .editorManagedObjectTags = managedObjectAsset != nullptr ? joinManagedTags(managedObjectAsset->tags) : std::string{},
+        .editorManagedObjectCollisionHalfExtents = managedObjectAsset != nullptr ? managedObjectAsset->collisionHalfExtents : util::Vec3{},
+        .editorManagedObjectCollisionCenterOffset = managedObjectAsset != nullptr ? managedObjectAsset->collisionCenterOffset : util::Vec3{},
+        .editorManagedObjectPreviewColor = managedObjectAsset != nullptr
+            ? util::Vec3{
+                static_cast<float>(managedObjectAsset->previewColor.r),
+                static_cast<float>(managedObjectAsset->previewColor.g),
+                static_cast<float>(managedObjectAsset->previewColor.b)}
+            : util::Vec3{},
+        .editorManagedObjectPlacementKind = managedObjectAsset != nullptr
+            ? (managedObjectAsset->placementKind == content::ObjectPlacementKind::Wall ? 1 : 0)
+            : 0,
+        .editorManagedObjectActiveMapRefCount = managedObjectActiveMapRefCount,
+        .editorManagedObjectStoredMapRefCount = managedObjectStoredMapRefCount,
+        .editorManagedObjectCylindrical = managedObjectAsset != nullptr ? managedObjectAsset->cylindricalFootprint : false,
+        .editorManagedObjectEditorVisible = managedObjectAsset != nullptr ? managedObjectAsset->editorVisible : true,
         .editorCellFloorLabel = editorCellFloorLabel,
         .editorCellCoverLabel = editorCellCoverLabel,
         .editorCellPropLabel = editorCellPropLabel,
@@ -1143,6 +1081,8 @@ void Application::tick(const float deltaSeconds) {
         .selectedEditorPropIndex = selectedEditorPropIndex_.has_value() ? static_cast<int>(*selectedEditorPropIndex_) : -1,
         .hasSelectedEditorProp = selectedEditorProp != nullptr,
         .selectedEditorPropLabel = selectedEditorProp != nullptr ? propDisplayLabel(*selectedEditorProp) : std::string{},
+        .selectedEditorPropAssetId = selectedEditorProp != nullptr ? selectedEditorProp->id : std::string{},
+        .selectedEditorPropCategoryLabel = selectedEditorProp != nullptr ? selectedEditorProp->category : std::string{},
         .selectedEditorPropModelLabel = selectedEditorProp != nullptr ? pathDisplayLabel(selectedEditorProp->modelPath) : std::string{},
         .selectedEditorPropMaterialLabel = selectedEditorProp != nullptr ? pathDisplayLabel(selectedEditorProp->materialPath) : std::string{},
         .selectedEditorPropPosition = selectedEditorProp != nullptr ? selectedEditorProp->position : util::Vec3{},
@@ -1190,15 +1130,28 @@ void Application::bootstrapProjectFiles() {
     util::FileSystem::ensureDirectory(assetRoot_ / "generated");
     util::FileSystem::ensureDirectory(assetRoot_ / "maps");
     contentDatabase_.bootstrap(assetRoot_);
+    clampMapEditorAssetSelection();
+    clampManagedObjectAssetSelection();
+    const auto& objectAssets = contentDatabase_.objectAssets();
+    const auto crateObjectIt = std::find_if(objectAssets.begin(), objectAssets.end(), [](const content::ObjectAssetDefinition& object) {
+        return object.id == "wooden_crate";
+    });
+    if (crateObjectIt != objectAssets.end()) {
+        editorObjectAssetIndex_ = static_cast<std::size_t>(std::distance(objectAssets.begin(), crateObjectIt));
+        managedObjectAssetIndex_ = editorObjectAssetIndex_;
+    }
+    clampMapEditorAssetSelection();
 
     spdlog::info("[Init] 正在导出场景文件与预览图...");
     activeMap_ = gameplay::makeDefaultBombDefusalMap(assetRoot_);
+    contentDatabase_.resolveMapData(activeMap_);
     activeMapPath_ = assetRoot_ / "maps" / "depot_lab.arena";
     saveActiveMapArtifacts("初始化默认场景");
     {
         const auto previousMap = activeMap_;
         const auto previousPath = activeMapPath_;
         activeMap_ = gameplay::makeMetroStationShowcaseMap(assetRoot_);
+        contentDatabase_.resolveMapData(activeMap_);
         activeMapPath_ = assetRoot_ / "maps" / "metro_platform.arena";
         saveActiveMapArtifacts("初始化 Metro 展示场景");
         activeMap_ = previousMap;
@@ -1612,6 +1565,53 @@ void Application::handleRendererUiActions() {
         return;
     }
 
+    const auto trimText = [](std::string value) {
+        auto isSpace = [](unsigned char character) {
+            return std::isspace(character) != 0;
+        };
+        while (!value.empty() && isSpace(static_cast<unsigned char>(value.front()))) {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && isSpace(static_cast<unsigned char>(value.back()))) {
+            value.pop_back();
+        }
+        return value;
+    };
+    const auto splitTags = [&](std::string value) {
+        std::vector<std::string> tags;
+        std::string currentTag;
+        auto flush = [&]() {
+            const std::string trimmed = trimText(currentTag);
+            if (!trimmed.empty()) {
+                tags.push_back(trimmed);
+            }
+            currentTag.clear();
+        };
+        for (char character : value) {
+            if (character == ',' || character == ';' || character == '\n') {
+                flush();
+            } else {
+                currentTag.push_back(character);
+            }
+        }
+        flush();
+        return tags;
+    };
+    const auto updateManagedObject = [&](const auto& mutator) {
+        if (currentFlow_ != AppFlow::MapEditor) {
+            return;
+        }
+        const content::ObjectAssetDefinition* current = selectedManagedObjectAsset();
+        if (current == nullptr) {
+            mapEditorStatus_ = "当前没有可编辑的对象资产";
+            needsRedraw_ = true;
+            return;
+        }
+        content::ObjectAssetDefinition definition = *current;
+        mutator(definition);
+        saveManagedObjectAsset(definition, current->id);
+    };
+
     for (const renderer::UiAction& action : renderer_->consumeUiActions()) {
         switch (action.type) {
             case renderer::UiActionType::ActivateMainMenuItem:
@@ -1666,28 +1666,117 @@ void Application::handleRendererUiActions() {
                     action.value0 >= 0 &&
                     action.value0 <= static_cast<int>(MapEditorPlacementKind::DefenderSpawn)) {
                     mapEditorPlacementKind_ = static_cast<MapEditorPlacementKind>(action.value0);
+                    clampMapEditorAssetSelection();
                     mapEditorTool_ = MapEditorTool::Place;
                     mapEditorStatus_ = std::string("放置类型: ") + mapEditorPlacementKindLabel();
                     needsRedraw_ = true;
                 }
                 break;
-            case renderer::UiActionType::SelectEditorWallMaterial:
+            case renderer::UiActionType::SelectEditorObjectAsset:
                 if (currentFlow_ == AppFlow::MapEditor && action.value0 >= 0) {
-                    editorWallMaterialIndex_ = std::min<std::size_t>(
-                        static_cast<std::size_t>(action.value0),
-                        kEditorWallMaterialPresets.size() - 1);
-                    mapEditorStatus_ = std::string("墙体材质: ") + editorWallMaterialPreset(editorWallMaterialIndex_).label;
+                    editorObjectAssetIndex_ = static_cast<std::size_t>(action.value0);
+                    clampMapEditorAssetSelection();
+                    if (const auto* object = selectedMapEditorObjectAsset(); object != nullptr) {
+                        mapEditorStatus_ = std::string("当前对象: ") + object->label;
+                    }
                     needsRedraw_ = true;
                 }
                 break;
-            case renderer::UiActionType::SelectEditorPropPreset:
+            case renderer::UiActionType::SelectManagedObjectAsset:
                 if (currentFlow_ == AppFlow::MapEditor && action.value0 >= 0) {
-                    editorPropPresetIndex_ = std::min<std::size_t>(
-                        static_cast<std::size_t>(action.value0),
-                        kEditorPropPresets.size() - 1);
-                    mapEditorStatus_ = std::string("道具模板: ") + editorPropPreset(editorPropPresetIndex_).label;
+                    managedObjectAssetIndex_ = static_cast<std::size_t>(action.value0);
+                    clampManagedObjectAssetSelection();
+                    if (const auto* object = selectedManagedObjectAsset(); object != nullptr) {
+                        mapEditorStatus_ = std::string("资产管理器当前对象: ") + object->label;
+                    }
                     needsRedraw_ = true;
                 }
+                break;
+            case renderer::UiActionType::CreateManagedObjectAsset:
+                if (currentFlow_ == AppFlow::MapEditor) {
+                    createManagedObjectAsset();
+                }
+                break;
+            case renderer::UiActionType::DeleteManagedObjectAsset:
+                if (currentFlow_ == AppFlow::MapEditor) {
+                    deleteManagedObjectAsset();
+                }
+                break;
+            case renderer::UiActionType::SaveManagedObjectAsset:
+                if (currentFlow_ == AppFlow::MapEditor) {
+                    mapEditorStatus_ = "对象资产已同步保存";
+                    needsRedraw_ = true;
+                }
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetId:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.id = trimText(action.text);
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetLabel:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.label = trimText(action.text);
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetCategory:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.category = trimText(action.text);
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetModelPath:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.modelPath = trimText(action.text);
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetMaterialPath:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.materialPath = trimText(action.text);
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetTags:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.tags = splitTags(action.text);
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetPlacementKind:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.placementKind = action.value0 == 1
+                        ? content::ObjectPlacementKind::Wall
+                        : content::ObjectPlacementKind::Prop;
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetCollisionHalfExtents:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.collisionHalfExtents = {
+                        std::max(0.01f, std::abs(action.vectorValue.x)),
+                        std::max(0.01f, std::abs(action.vectorValue.y)),
+                        std::max(0.01f, std::abs(action.vectorValue.z)),
+                    };
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetCollisionCenterOffset:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.collisionCenterOffset = action.vectorValue;
+                });
+                break;
+            case renderer::UiActionType::SetManagedObjectAssetPreviewColor:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.previewColor = {
+                        static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::lround(action.vectorValue.x)), 0, 255)),
+                        static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::lround(action.vectorValue.y)), 0, 255)),
+                        static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::lround(action.vectorValue.z)), 0, 255)),
+                    };
+                });
+                break;
+            case renderer::UiActionType::ToggleManagedObjectAssetCylindrical:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.cylindricalFootprint = action.value0 != 0;
+                });
+                break;
+            case renderer::UiActionType::ToggleManagedObjectAssetEditorVisible:
+                updateManagedObject([&](content::ObjectAssetDefinition& definition) {
+                    definition.editorVisible = action.value0 != 0;
+                });
                 break;
             case renderer::UiActionType::SetSelectedEditorPropPosition:
                 if (currentFlow_ == AppFlow::MapEditor) {
@@ -1710,6 +1799,27 @@ void Application::handleRendererUiActions() {
                         mapEditorViewMode_ == MapEditorViewMode::Perspective
                             ? MapEditorViewMode::Ortho25D
                             : MapEditorViewMode::Perspective);
+                }
+                break;
+            case renderer::UiActionType::ToggleMapEditorMeshOutline:
+                if (currentFlow_ == AppFlow::MapEditor) {
+                    mapEditorShowMeshOutline_ = action.value0 != 0;
+                    mapEditorStatus_ = mapEditorShowMeshOutline_ ? "已显示真实轮廓" : "已隐藏真实轮廓";
+                    needsRedraw_ = true;
+                }
+                break;
+            case renderer::UiActionType::ToggleMapEditorCollisionOutline:
+                if (currentFlow_ == AppFlow::MapEditor) {
+                    mapEditorShowCollisionOutline_ = action.value0 != 0;
+                    mapEditorStatus_ = mapEditorShowCollisionOutline_ ? "已显示碰撞箱轮廓" : "已隐藏碰撞箱轮廓";
+                    needsRedraw_ = true;
+                }
+                break;
+            case renderer::UiActionType::ToggleMapEditorBoundingBox:
+                if (currentFlow_ == AppFlow::MapEditor) {
+                    mapEditorShowBoundingBox_ = action.value0 != 0;
+                    mapEditorStatus_ = mapEditorShowBoundingBox_ ? "已显示最小包裹箱" : "已隐藏最小包裹箱";
+                    needsRedraw_ = true;
                 }
                 break;
             case renderer::UiActionType::UndoMapEditorChange:
@@ -2316,6 +2426,7 @@ void Application::applyLatestNetworkMapState() {
     }
 
     gameplay::MapData syncedMap = gameplay::MapSerializer::deserialize(mapState.mapContent);
+    contentDatabase_.resolveMapData(syncedMap);
     const bool mapLooksValid = syncedMap.width > 0 && syncedMap.depth > 0 &&
         (!syncedMap.spawns.empty() || !syncedMap.props.empty() || !syncedMap.name.empty());
     if (!mapLooksValid) {
@@ -3141,28 +3252,29 @@ gameplay::MapProp Application::buildMapEditorPlacementPreviewProp() const {
         : util::Vec3{0.0f, 1.0f, 0.0f};
 
     gameplay::MapProp prop{};
+    const content::ObjectAssetDefinition* selectedObjectAsset = selectedMapEditorObjectAsset();
     if (mapEditorPlacementKind_ == MapEditorPlacementKind::Wall) {
-        const auto& wallPreset = editorWallMaterialPreset(editorWallMaterialIndex_);
         const auto& scalePreset = editorPropScalePreset(editorPropScalePresetIndex_);
-        prop = gameplay::MapProp{
-            std::string("editor_brush_wall_") + wallPreset.id,
+        const std::string objectId =
+            selectedObjectAsset != nullptr && selectedObjectAsset->placementKind == content::ObjectPlacementKind::Wall
+                ? selectedObjectAsset->id
+                : "editor_brush_wall";
+        prop = contentDatabase_.instantiateMapProp(
+            objectId,
             targetPoint,
-            assetRoot_ / editorBrushModelRelativePath(),
-            assetRoot_ / editorWallMaterialRelativePath(wallPreset.id),
             {0.0f, editorPropRotationDegrees_, 0.0f},
-            {2.4f * scalePreset.uniformScale, 2.6f * scalePreset.uniformScale, 0.36f * scalePreset.uniformScale},
-        };
+            {2.4f * scalePreset.uniformScale, 2.6f * scalePreset.uniformScale, 0.36f * scalePreset.uniformScale});
     } else {
-        const auto& propPreset = editorPropPreset(editorPropPresetIndex_);
         const auto& scalePreset = editorPropScalePreset(editorPropScalePresetIndex_);
-        prop = gameplay::MapProp{
-            propPreset.id,
+        const std::string objectId =
+            selectedObjectAsset != nullptr && selectedObjectAsset->placementKind == content::ObjectPlacementKind::Prop
+                ? selectedObjectAsset->id
+                : "wooden_crate";
+        prop = contentDatabase_.instantiateMapProp(
+            objectId,
             targetPoint,
-            assetRoot_ / propPreset.modelRelativePath,
-            assetRoot_ / propPreset.materialRelativePath,
             {0.0f, editorPropRotationDegrees_, 0.0f},
-            {scalePreset.uniformScale, scalePreset.uniformScale, scalePreset.uniformScale},
-        };
+            {scalePreset.uniformScale, scalePreset.uniformScale, scalePreset.uniformScale});
     }
 
     prop.position = clampEditorTargetPosition(
@@ -3191,6 +3303,7 @@ void Application::cycleMapEditorPlacementKind(const int delta) {
     const int count = static_cast<int>(MapEditorPlacementKind::DefenderSpawn) + 1;
     const int current = static_cast<int>(mapEditorPlacementKind_);
     mapEditorPlacementKind_ = static_cast<MapEditorPlacementKind>((current + delta + count) % count);
+    clampMapEditorAssetSelection();
     mapEditorTool_ = MapEditorTool::Place;
     mapEditorStatus_ = std::string("放置类型: ") + mapEditorPlacementKindLabel();
     needsRedraw_ = true;
@@ -3224,6 +3337,272 @@ bool Application::restoreMapEditorUndoSnapshot() {
 
 void Application::clearMapEditorUndoHistory() {
     mapEditorUndoStack_.clear();
+}
+
+void Application::clampMapEditorAssetSelection() {
+    const auto& objectAssets = contentDatabase_.objectAssets();
+    if (objectAssets.empty()) {
+        editorObjectAssetIndex_ = 0;
+        return;
+    }
+    if (editorObjectAssetIndex_ >= objectAssets.size()) {
+        editorObjectAssetIndex_ = objectAssets.size() - 1;
+    }
+    if (selectedMapEditorObjectAsset() != nullptr) {
+        return;
+    }
+    for (std::size_t index = 0; index < objectAssets.size(); ++index) {
+        editorObjectAssetIndex_ = index;
+        if (selectedMapEditorObjectAsset() != nullptr) {
+            return;
+        }
+    }
+}
+
+void Application::clampManagedObjectAssetSelection() {
+    const auto& objectAssets = contentDatabase_.objectAssets();
+    if (objectAssets.empty()) {
+        managedObjectAssetIndex_ = 0;
+    } else if (managedObjectAssetIndex_ >= objectAssets.size()) {
+        managedObjectAssetIndex_ = objectAssets.size() - 1;
+    }
+}
+
+std::vector<const content::ObjectAssetDefinition*> Application::mapEditorSelectableObjects() const {
+    std::vector<const content::ObjectAssetDefinition*> objects;
+    const auto& allObjects = contentDatabase_.objectAssets();
+    if (mapEditorPlacementKind_ != MapEditorPlacementKind::Wall &&
+        mapEditorPlacementKind_ != MapEditorPlacementKind::Prop) {
+        return objects;
+    }
+
+    const content::ObjectPlacementKind placementKind = mapEditorPlacementKind_ == MapEditorPlacementKind::Wall
+        ? content::ObjectPlacementKind::Wall
+        : content::ObjectPlacementKind::Prop;
+    for (const auto& object : allObjects) {
+        if (!object.editorVisible || object.placementKind != placementKind) {
+            continue;
+        }
+        objects.push_back(&object);
+    }
+    return objects;
+}
+
+const content::ObjectAssetDefinition* Application::selectedMapEditorObjectAsset() const {
+    const auto& objectAssets = contentDatabase_.objectAssets();
+    if (objectAssets.empty() ||
+        (mapEditorPlacementKind_ != MapEditorPlacementKind::Wall &&
+         mapEditorPlacementKind_ != MapEditorPlacementKind::Prop)) {
+        return nullptr;
+    }
+
+    const content::ObjectPlacementKind placementKind = mapEditorPlacementKind_ == MapEditorPlacementKind::Wall
+        ? content::ObjectPlacementKind::Wall
+        : content::ObjectPlacementKind::Prop;
+
+    const auto isSelectable = [placementKind](const content::ObjectAssetDefinition& object) {
+        return object.editorVisible && object.placementKind == placementKind;
+    };
+
+    const std::size_t clampedIndex = std::min(editorObjectAssetIndex_, objectAssets.size() - 1);
+    if (isSelectable(objectAssets[clampedIndex])) {
+        return &objectAssets[clampedIndex];
+    }
+
+    const auto it = std::find_if(objectAssets.begin(), objectAssets.end(), isSelectable);
+    return it != objectAssets.end() ? &*it : nullptr;
+}
+
+const content::ObjectAssetDefinition* Application::selectedManagedObjectAsset() const {
+    const auto& objectAssets = contentDatabase_.objectAssets();
+    if (objectAssets.empty()) {
+        return nullptr;
+    }
+    const std::size_t clampedIndex = std::min(managedObjectAssetIndex_, objectAssets.size() - 1);
+    return &objectAssets[clampedIndex];
+}
+
+std::size_t Application::findObjectAssetIndexById(const std::string_view id) const {
+    const auto& objectAssets = contentDatabase_.objectAssets();
+    const auto it = std::find_if(objectAssets.begin(), objectAssets.end(), [id](const content::ObjectAssetDefinition& object) {
+        return object.id == id;
+    });
+    return it != objectAssets.end()
+        ? static_cast<std::size_t>(std::distance(objectAssets.begin(), it))
+        : objectAssets.size();
+}
+
+std::string Application::makeNextObjectAssetId(const std::string_view seed) const {
+    std::string base;
+    base.reserve(seed.size() + 16);
+    for (const unsigned char character : seed) {
+        if (std::isalnum(character) != 0) {
+            base.push_back(static_cast<char>(std::tolower(character)));
+        } else if (character == '_' || character == '-' || character == ' ') {
+            if (base.empty() || base.back() == '_') {
+                continue;
+            }
+            base.push_back('_');
+        }
+    }
+    while (!base.empty() && base.back() == '_') {
+        base.pop_back();
+    }
+    if (base.empty()) {
+        base = "custom_object";
+    }
+
+    const auto& objectAssets = contentDatabase_.objectAssets();
+    auto exists = [&objectAssets](const std::string_view id) {
+        return std::ranges::any_of(objectAssets, [id](const content::ObjectAssetDefinition& object) {
+            return object.id == id;
+        });
+    };
+    if (!exists(base)) {
+        return base;
+    }
+
+    for (int index = 1; index <= 9999; ++index) {
+        std::ostringstream candidate;
+        candidate << base << '_' << std::setw(2) << std::setfill('0') << index;
+        if (!exists(candidate.str())) {
+            return candidate.str();
+        }
+    }
+    return base + "_overflow";
+}
+
+int Application::countObjectAssetReferencesInMap(const gameplay::MapData& map, const std::string_view id) const {
+    return static_cast<int>(std::count_if(map.props.begin(), map.props.end(), [id](const gameplay::MapProp& prop) {
+        return prop.id == id;
+    }));
+}
+
+int Application::countObjectAssetReferencesInStoredMaps(const std::string_view id) const {
+    int count = 0;
+    for (const auto& path : mapCatalogPaths_) {
+        gameplay::MapData map = gameplay::MapSerializer::load(path);
+        count += countObjectAssetReferencesInMap(map, id);
+    }
+    return count;
+}
+
+void Application::createManagedObjectAsset() {
+    const content::ObjectAssetDefinition* templateAsset = selectedManagedObjectAsset();
+    content::ObjectAssetDefinition definition = templateAsset != nullptr
+        ? *templateAsset
+        : content::ObjectAssetDefinition{};
+    definition.id = makeNextObjectAssetId(templateAsset != nullptr ? templateAsset->id + "_copy" : "custom_object");
+    if (definition.label.empty()) {
+        definition.label = "新对象";
+    } else {
+        definition.label += " 副本";
+    }
+    if (definition.category.empty()) {
+        definition.category = "自定义";
+    }
+    if (definition.modelPath.empty()) {
+        definition.modelPath = "generated/models/crate.obj";
+    }
+    if (definition.previewColor.r == 0 && definition.previewColor.g == 0 && definition.previewColor.b == 0) {
+        definition.previewColor = {160, 164, 170};
+    }
+    if (contentDatabase_.upsertObjectAsset(definition)) {
+        managedObjectAssetIndex_ = findObjectAssetIndexById(definition.id);
+        if (definition.editorVisible &&
+            ((definition.placementKind == content::ObjectPlacementKind::Prop && mapEditorPlacementKind_ == MapEditorPlacementKind::Prop) ||
+             (definition.placementKind == content::ObjectPlacementKind::Wall && mapEditorPlacementKind_ == MapEditorPlacementKind::Wall))) {
+            editorObjectAssetIndex_ = managedObjectAssetIndex_;
+        }
+        clampManagedObjectAssetSelection();
+        clampMapEditorAssetSelection();
+        mapEditorStatus_ = std::string("已创建对象资产: ") + definition.label;
+    } else {
+        mapEditorStatus_ = "创建对象资产失败";
+    }
+    needsRedraw_ = true;
+}
+
+void Application::saveManagedObjectAsset(const content::ObjectAssetDefinition& definition, const std::string_view previousId) {
+    const content::ObjectAssetDefinition* current = selectedManagedObjectAsset();
+    if (current == nullptr) {
+        mapEditorStatus_ = "当前没有可编辑的对象资产";
+        needsRedraw_ = true;
+        return;
+    }
+
+    if (definition.id.empty()) {
+        mapEditorStatus_ = "对象资产 id 不能为空";
+        needsRedraw_ = true;
+        return;
+    }
+
+    const std::size_t existingIndex = findObjectAssetIndexById(definition.id);
+    if (definition.id != previousId && existingIndex < contentDatabase_.objectAssets().size()) {
+        mapEditorStatus_ = std::string("对象资产 id 已存在: ") + definition.id;
+        needsRedraw_ = true;
+        return;
+    }
+
+    if (definition.id != previousId) {
+        const int activeRefs = countObjectAssetReferencesInMap(activeMap_, previousId);
+        const int storedRefs = countObjectAssetReferencesInStoredMaps(previousId);
+        if (activeRefs > 0 || storedRefs > 0) {
+            mapEditorStatus_ = std::string("对象资产正在被地图引用，不能直接改 id: ") + std::string(previousId);
+            needsRedraw_ = true;
+            return;
+        }
+    }
+
+    if (!contentDatabase_.upsertObjectAsset(definition)) {
+        mapEditorStatus_ = std::string("保存对象资产失败: ") + definition.label;
+        needsRedraw_ = true;
+        return;
+    }
+
+    if (definition.id != previousId) {
+        contentDatabase_.removeObjectAsset(previousId);
+    }
+    contentDatabase_.resolveMapData(activeMap_);
+    managedObjectAssetIndex_ = findObjectAssetIndexById(definition.id);
+    if (selectedMapEditorObjectAsset() != nullptr && selectedMapEditorObjectAsset()->id == previousId) {
+        editorObjectAssetIndex_ = managedObjectAssetIndex_;
+    }
+    clampManagedObjectAssetSelection();
+    clampMapEditorAssetSelection();
+    mapEditorStatus_ = std::string("已保存对象资产: ") + definition.label;
+    needsRedraw_ = true;
+}
+
+void Application::deleteManagedObjectAsset() {
+    const content::ObjectAssetDefinition* current = selectedManagedObjectAsset();
+    if (current == nullptr) {
+        mapEditorStatus_ = "当前没有可删除的对象资产";
+        needsRedraw_ = true;
+        return;
+    }
+
+    const int activeRefs = countObjectAssetReferencesInMap(activeMap_, current->id);
+    const int storedRefs = countObjectAssetReferencesInStoredMaps(current->id);
+    if (activeRefs > 0 || storedRefs > 0) {
+        mapEditorStatus_ = std::string("对象资产仍被地图引用，不能删除: ") + current->label;
+        needsRedraw_ = true;
+        return;
+    }
+
+    const std::string deletedId = current->id;
+    const std::string deletedLabel = current->label;
+    if (!contentDatabase_.removeObjectAsset(deletedId)) {
+        mapEditorStatus_ = std::string("删除对象资产失败: ") + deletedLabel;
+        needsRedraw_ = true;
+        return;
+    }
+    clampManagedObjectAssetSelection();
+    if (selectedMapEditorObjectAsset() != nullptr && selectedMapEditorObjectAsset()->id == deletedId) {
+        clampMapEditorAssetSelection();
+    }
+    mapEditorStatus_ = std::string("已删除对象资产: ") + deletedLabel;
+    needsRedraw_ = true;
 }
 
 void Application::setSelectedMapEditorPropPosition(const util::Vec3& position) {
@@ -3693,7 +4072,8 @@ void Application::loadEditorMapByIndex(const std::size_t index) {
 
     activeMapCatalogIndex_ = std::min(index, mapCatalogPaths_.size() - 1);
     activeMapPath_ = mapCatalogPaths_[activeMapCatalogIndex_];
-    const gameplay::MapData loadedMap = gameplay::MapSerializer::load(activeMapPath_);
+    gameplay::MapData loadedMap = gameplay::MapSerializer::load(activeMapPath_);
+    contentDatabase_.resolveMapData(loadedMap);
     if (!loadedMap.props.empty() || !loadedMap.spawns.empty() || !loadedMap.name.empty()) {
         activeMap_ = loadedMap;
     }
@@ -3729,55 +4109,37 @@ gameplay::MapData Application::makeBlankEditorMap(const std::string& name) const
         .lights = {},
     };
 
-    const auto brushModel = assetRoot_ / editorBrushModelRelativePath();
-    const auto floorMaterial = assetRoot_ / editorFloorMaterialRelativePath();
-    const auto wallMaterial = assetRoot_ / editorWallMaterialRelativePath("wall_concrete");
     constexpr float kFloorThickness = 0.10f;
     constexpr float kWallThickness = 0.50f;
     constexpr float kWallHeight = 3.20f;
     const float width = static_cast<float>(map.width);
     const float depth = static_cast<float>(map.depth);
 
-    map.props.push_back(gameplay::MapProp{
+    map.props.push_back(contentDatabase_.instantiateMapProp(
         "editor_brush_floor",
         {width * 0.5f, -kFloorThickness, depth * 0.5f},
-        brushModel,
-        floorMaterial,
         {},
-        {width, kFloorThickness, depth},
-    });
-    map.props.push_back(gameplay::MapProp{
-        "editor_brush_perimeter_west",
+        {width, kFloorThickness, depth}));
+    map.props.push_back(contentDatabase_.instantiateMapProp(
+        "editor_brush_wall",
         {kWallThickness * 0.5f, 0.0f, depth * 0.5f},
-        brushModel,
-        wallMaterial,
         {},
-        {kWallThickness, kWallHeight, depth},
-    });
-    map.props.push_back(gameplay::MapProp{
-        "editor_brush_perimeter_east",
+        {kWallThickness, kWallHeight, depth}));
+    map.props.push_back(contentDatabase_.instantiateMapProp(
+        "editor_brush_wall",
         {width - kWallThickness * 0.5f, 0.0f, depth * 0.5f},
-        brushModel,
-        wallMaterial,
         {},
-        {kWallThickness, kWallHeight, depth},
-    });
-    map.props.push_back(gameplay::MapProp{
-        "editor_brush_perimeter_north",
+        {kWallThickness, kWallHeight, depth}));
+    map.props.push_back(contentDatabase_.instantiateMapProp(
+        "editor_brush_wall",
         {width * 0.5f, 0.0f, kWallThickness * 0.5f},
-        brushModel,
-        wallMaterial,
         {},
-        {width, kWallHeight, kWallThickness},
-    });
-    map.props.push_back(gameplay::MapProp{
-        "editor_brush_perimeter_south",
+        {width, kWallHeight, kWallThickness}));
+    map.props.push_back(contentDatabase_.instantiateMapProp(
+        "editor_brush_wall",
         {width * 0.5f, 0.0f, depth - kWallThickness * 0.5f},
-        brushModel,
-        wallMaterial,
         {},
-        {width, kWallHeight, kWallThickness},
-    });
+        {width, kWallHeight, kWallThickness}));
 
     map.spawns.push_back(gameplay::SpawnPoint{gameplay::Team::Attackers, {3.5f, 1.0f, 3.5f}});
     map.spawns.push_back(gameplay::SpawnPoint{gameplay::Team::Defenders, {20.5f, 1.0f, 20.5f}});
@@ -3816,6 +4178,7 @@ void Application::saveActiveMapArtifacts(const char* reason) {
     if (activeMapPath_.empty()) {
         activeMapPath_ = assetRoot_ / "maps" / "depot_lab.arena";
     }
+    contentDatabase_.resolveMapData(activeMap_);
     gameplay::MapSerializer::save(activeMap_, activeMapPath_);
     const auto previewPath = assetRoot_ / "generated" / (activeMapPath_.stem().string() + "_preview.ppm");
     gameplay::MapEditor(activeMap_).exportTopDownPreview(previewPath);

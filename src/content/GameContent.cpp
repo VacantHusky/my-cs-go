@@ -2,8 +2,11 @@
 
 #include "util/FileSystem.h"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <sstream>
 #include <vector>
@@ -179,13 +182,129 @@ std::vector<OpticType> commonOptics() {
     return {OpticType::RedDot, OpticType::X2, OpticType::X4, OpticType::X8};
 }
 
+std::string lowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+std::filesystem::path normalizeCatalogPath(const std::filesystem::path& assetRoot,
+                                           const std::filesystem::path& path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    std::error_code error;
+    if (path.is_absolute()) {
+        const std::filesystem::path relative = std::filesystem::relative(path, assetRoot, error);
+        if (!error && !relative.empty()) {
+            return relative.lexically_normal();
+        }
+    }
+
+    std::string generic = path.lexically_normal().generic_string();
+    if (generic.rfind("assets/", 0) == 0) {
+        generic.erase(0, 7);
+    }
+    return std::filesystem::path(generic).lexically_normal();
+}
+
+std::filesystem::path objectThumbnailPathFor(const AssetManifest& manifest,
+                                             const std::filesystem::path& modelPath,
+                                             const std::filesystem::path& materialPath) {
+    const std::string modelKey = modelPath.lexically_normal().generic_string();
+    if (!modelKey.empty()) {
+        const auto modelIt = std::find_if(manifest.models.begin(), manifest.models.end(), [&modelKey](const AssetManifestEntry& entry) {
+            return entry.path.lexically_normal().generic_string() == modelKey;
+        });
+        if (modelIt != manifest.models.end() && !modelIt->thumbnailPath.empty()) {
+            return modelIt->thumbnailPath;
+        }
+    }
+
+    const std::string materialKey = materialPath.lexically_normal().generic_string();
+    if (!materialKey.empty()) {
+        const auto materialIt = std::find_if(manifest.materials.begin(), manifest.materials.end(), [&materialKey](const MaterialAssetEntry& entry) {
+            return entry.materialPath.lexically_normal().generic_string() == materialKey;
+        });
+        if (materialIt != manifest.materials.end() && !materialIt->thumbnailPath.empty()) {
+            return materialIt->thumbnailPath;
+        }
+    }
+    return {};
+}
+
+const ObjectAssetDefinition* matchLegacyObjectAsset(const ObjectCatalog& catalog,
+                                                    const std::filesystem::path& assetRoot,
+                                                    const gameplay::MapProp& prop) {
+    const std::string legacyId = lowerAscii(prop.id);
+    const std::string modelPath = normalizeCatalogPath(assetRoot, prop.modelPath).generic_string();
+    const std::string materialPath = normalizeCatalogPath(assetRoot, prop.materialPath).generic_string();
+
+    if (!legacyId.empty()) {
+        if (const auto* exact = catalog.find(prop.id); exact != nullptr) {
+            return exact;
+        }
+    }
+
+    int bestScore = 0;
+    const ObjectAssetDefinition* best = nullptr;
+    for (const auto& candidate : catalog.objects) {
+        int score = 0;
+        const std::string candidateId = lowerAscii(candidate.id);
+        if (!modelPath.empty() && candidate.modelPath.lexically_normal().generic_string() == modelPath) {
+            score += 80;
+        }
+        if (!materialPath.empty() && candidate.materialPath.lexically_normal().generic_string() == materialPath) {
+            score += 40;
+        }
+        if (!legacyId.empty() && (candidateId == legacyId || candidateId.find(legacyId) != std::string::npos ||
+                                  legacyId.find(candidateId) != std::string::npos)) {
+            score += 30;
+        }
+        if (!legacyId.empty()) {
+            if (legacyId.find("barrel") != std::string::npos && candidateId.find("barrel") != std::string::npos) {
+                score += 20;
+            }
+            if (legacyId.find("crate") != std::string::npos && candidateId.find("crate") != std::string::npos) {
+                score += 20;
+            }
+            if (legacyId.find("floor") != std::string::npos && candidateId.find("floor") != std::string::npos) {
+                score += 20;
+            }
+            if ((legacyId.find("wall") != std::string::npos || legacyId.find("perimeter") != std::string::npos) &&
+                candidateId.find("wall") != std::string::npos) {
+                score += 20;
+            }
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            best = &candidate;
+        }
+    }
+    return bestScore > 0 ? best : nullptr;
+}
+
 }  // namespace
 
 void ContentDatabase::bootstrap(const std::filesystem::path& assetRoot) {
+    assetRoot_ = assetRoot;
     createPlaceholderAssets(assetRoot);
     createMaterialProfiles(assetRoot);
     createWeaponCatalog(assetRoot);
     createCharacterCatalog(assetRoot);
+    assetManifest_ = buildAssetManifest(assetRoot);
+    createObjectCatalog(assetRoot);
+    if (!writeAssetManifest(assetRoot, assetManifest_)) {
+        spdlog::warn("[Content] Failed to write asset manifest: {}", (assetRoot / assetManifest_.manifestPath).generic_string());
+    } else {
+        spdlog::info("[Content] Asset manifest ready: models={} selectableModels={} textures={} selectableMaterials={}",
+            assetManifest_.models.size(),
+            assetManifest_.editorModels.size(),
+            assetManifest_.textures.size(),
+            assetManifest_.editorMaterials.size());
+    }
 }
 
 void ContentDatabase::createPlaceholderAssets(const std::filesystem::path& assetRoot) {
@@ -373,7 +492,13 @@ void ContentDatabase::createCharacterCatalog(const std::filesystem::path& assetR
 
     const auto generatedModel = assetRoot / "generated" / "models" / "lowpoly_operator.obj";
     const auto demeliusModel = assetRoot / "source" / "characters" / "demelius_low_poly" / "Low-poly_character.glb";
+    const auto superheroMaleModel = assetRoot / "source" / "itchio" / "universal_base_characters_standard" /
+        "Base Characters" / "Godot - UE" / "Superhero_Male_FullBody.gltf";
+    const auto superheroFemaleModel = assetRoot / "source" / "itchio" / "universal_base_characters_standard" /
+        "Base Characters" / "Godot - UE" / "Superhero_Female_FullBody.gltf";
     const bool hasDemeliusModel = util::FileSystem::exists(demeliusModel);
+    const bool hasSuperheroMaleModel = util::FileSystem::exists(superheroMaleModel);
+    const bool hasSuperheroFemaleModel = util::FileSystem::exists(superheroFemaleModel);
 
     characters_.push_back(CharacterDefinition{
         .id = "default_operator",
@@ -386,6 +511,61 @@ void ContentDatabase::createCharacterCatalog(const std::filesystem::path& assetR
         .modelScale = 1.0f,
         .yawOffsetRadians = 1.57079632679f,
     });
+
+    if (hasSuperheroMaleModel) {
+        characters_.push_back(CharacterDefinition{
+            .id = "universal_superhero_male",
+            .displayName = "通用角色 男",
+            .assets = {
+                .modelPath = superheroMaleModel,
+                .albedoPath = {},
+                .materialPath = {},
+            },
+            .modelScale = 1.0f,
+            .yawOffsetRadians = 1.57079632679f,
+        });
+    }
+
+    if (hasSuperheroFemaleModel) {
+        characters_.push_back(CharacterDefinition{
+            .id = "universal_superhero_female",
+            .displayName = "通用角色 女",
+            .assets = {
+                .modelPath = superheroFemaleModel,
+                .albedoPath = {},
+                .materialPath = {},
+            },
+            .modelScale = 1.0f,
+            .yawOffsetRadians = 1.57079632679f,
+        });
+    }
+}
+
+void ContentDatabase::createObjectCatalog(const std::filesystem::path& assetRoot) {
+    ObjectCatalog catalog = buildDefaultObjectCatalog(assetRoot, assetManifest_);
+    const std::filesystem::path catalogPath = assetRoot / catalog.catalogPath;
+    if (util::FileSystem::exists(catalogPath)) {
+        const ObjectCatalog loadedCatalog = loadObjectCatalog(assetRoot, catalogPath);
+        for (const auto& object : loadedCatalog.objects) {
+            catalog.upsert(object);
+        }
+    }
+
+    objectCatalog_ = std::move(catalog);
+    if (!persistObjectCatalog()) {
+        spdlog::warn("[Content] Failed to write object catalog: {}", (assetRoot / objectCatalog_.catalogPath).generic_string());
+    } else {
+        spdlog::info("[Content] Object catalog ready: {} objects, {} editor categories",
+            objectCatalog_.objects.size(),
+            objectCatalog_.categoryCount());
+    }
+}
+
+bool ContentDatabase::persistObjectCatalog() const {
+    if (assetRoot_.empty()) {
+        return false;
+    }
+    return writeObjectCatalog(assetRoot_, objectCatalog_);
 }
 
 const CharacterDefinition* ContentDatabase::findCharacter(const std::string_view id) const {
@@ -395,8 +575,83 @@ const CharacterDefinition* ContentDatabase::findCharacter(const std::string_view
     return it != characters_.end() ? &*it : nullptr;
 }
 
+const ObjectAssetDefinition* ContentDatabase::findObjectAsset(const std::string_view id) const {
+    return objectCatalog_.find(id);
+}
+
 const CharacterDefinition* ContentDatabase::defaultCharacter() const {
     return characters_.empty() ? nullptr : &characters_.front();
+}
+
+gameplay::MapProp ContentDatabase::instantiateMapProp(const std::string_view objectId,
+                                                      const util::Vec3& position,
+                                                      const util::Vec3& rotationDegrees,
+                                                      const util::Vec3& scale) const {
+    gameplay::MapProp prop;
+    prop.id = std::string(objectId);
+    prop.position = position;
+    prop.rotationDegrees = rotationDegrees;
+    prop.scale = scale;
+    resolveMapProp(prop);
+    return prop;
+}
+
+bool ContentDatabase::resolveMapProp(gameplay::MapProp& prop) const {
+    const ObjectAssetDefinition* definition = nullptr;
+    if (!prop.id.empty()) {
+        definition = findObjectAsset(prop.id);
+    }
+    if (definition == nullptr) {
+        definition = matchLegacyObjectAsset(objectCatalog_, assetRoot_, prop);
+    }
+    if (definition == nullptr) {
+        if (prop.label.empty()) {
+            prop.label = prop.id.empty() ? "道具" : prop.id;
+        }
+        return false;
+    }
+
+    prop.id = definition->id;
+    prop.label = definition->label;
+    prop.category = definition->category;
+    prop.modelPath = definition->modelPath.empty()
+        ? std::filesystem::path{}
+        : (definition->modelPath.is_absolute() ? definition->modelPath : (assetRoot_ / definition->modelPath));
+    prop.materialPath = definition->materialPath.empty()
+        ? std::filesystem::path{}
+        : (definition->materialPath.is_absolute() ? definition->materialPath : (assetRoot_ / definition->materialPath));
+    prop.collisionHalfExtents = definition->collisionHalfExtents;
+    prop.collisionCenterOffset = definition->collisionCenterOffset;
+    prop.previewColor = definition->previewColor;
+    prop.cylindricalFootprint = definition->cylindricalFootprint;
+    return true;
+}
+
+void ContentDatabase::resolveMapData(gameplay::MapData& map) const {
+    for (auto& prop : map.props) {
+        resolveMapProp(prop);
+    }
+}
+
+bool ContentDatabase::upsertObjectAsset(ObjectAssetDefinition definition) {
+    definition.modelPath = normalizeCatalogPath(assetRoot_, definition.modelPath);
+    definition.materialPath = normalizeCatalogPath(assetRoot_, definition.materialPath);
+    if (definition.thumbnailPath.empty()) {
+        definition.thumbnailPath = objectThumbnailPathFor(assetManifest_, definition.modelPath, definition.materialPath);
+    } else {
+        definition.thumbnailPath = normalizeCatalogPath(assetRoot_, definition.thumbnailPath);
+    }
+    if (!objectCatalog_.upsert(std::move(definition))) {
+        return false;
+    }
+    return persistObjectCatalog();
+}
+
+bool ContentDatabase::removeObjectAsset(const std::string_view id) {
+    if (!objectCatalog_.remove(id)) {
+        return false;
+    }
+    return persistObjectCatalog();
 }
 
 }  // namespace mycsg::content

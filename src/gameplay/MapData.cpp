@@ -70,29 +70,19 @@ void writeVec3Array(std::ostringstream& out, const util::Vec3& value) {
     out << '[' << value.x << ", " << value.y << ", " << value.z << ']';
 }
 
-util::Vec3 previewPropHalfExtents(const MapProp& prop) {
-    const std::string key = lowerAscii(prop.id + " " + prop.modelPath.generic_string());
-    const util::Vec3 scale{
-        std::max(0.05f, std::abs(prop.scale.x)),
-        std::max(0.05f, std::abs(prop.scale.y)),
-        std::max(0.05f, std::abs(prop.scale.z)),
+util::Vec3 scaledPropHalfExtents(const MapProp& prop) {
+    return {
+        std::max(0.05f, std::abs(prop.scale.x)) * std::max(0.01f, prop.collisionHalfExtents.x),
+        std::max(0.05f, std::abs(prop.scale.y)) * std::max(0.01f, prop.collisionHalfExtents.y),
+        std::max(0.05f, std::abs(prop.scale.z)) * std::max(0.01f, prop.collisionHalfExtents.z),
     };
+}
 
-    if (key.find("editor_brush") != std::string::npos ||
-        lowerAscii(prop.modelPath.filename().string()) == "crate.obj") {
-        return {0.5f * scale.x, 0.5f * scale.y, 0.5f * scale.z};
-    }
-    if (key.find("barrel") != std::string::npos) {
-        return {0.34f * scale.x, 0.55f * scale.y, 0.34f * scale.z};
-    }
-    if (key.find("crate") != std::string::npos) {
-        return {0.48f * scale.x, 0.48f * scale.y, 0.48f * scale.z};
-    }
-    return {0.42f * scale.x, 0.52f * scale.y, 0.42f * scale.z};
+util::Vec3 previewPropHalfExtents(const MapProp& prop) {
+    return scaledPropHalfExtents(prop);
 }
 
 bool previewPropHitsFootprint(const MapProp& prop, const float x, const float z) {
-    const std::string key = lowerAscii(prop.id + " " + prop.modelPath.generic_string());
     const util::Vec3 half = previewPropHalfExtents(prop);
     const float dx = x - prop.position.x;
     const float dz = z - prop.position.z;
@@ -102,7 +92,7 @@ bool previewPropHitsFootprint(const MapProp& prop, const float x, const float z)
     const float localX = dx * cosine + dz * sine;
     const float localZ = -dx * sine + dz * cosine;
 
-    if (key.find("barrel") != std::string::npos) {
+    if (prop.cylindricalFootprint) {
         const float radius = std::max(half.x, half.z);
         return localX * localX + localZ * localZ <= radius * radius;
     }
@@ -110,45 +100,26 @@ bool previewPropHitsFootprint(const MapProp& prop, const float x, const float z)
 }
 
 util::ColorRgb8 previewPropColor(const MapProp& prop) {
-    const std::string key = lowerAscii(prop.id + " " + prop.modelPath.generic_string() + " " + prop.materialPath.generic_string());
-    if (key.find("bomb_site_a") != std::string::npos || key.find("site_a") != std::string::npos) {
-        return {174, 72, 56};
-    }
-    if (key.find("bomb_site_b") != std::string::npos || key.find("site_b") != std::string::npos) {
-        return {62, 96, 172};
-    }
-    if (key.find("floor") != std::string::npos) {
-        return {92, 100, 84};
-    }
-    if (key.find("wall") != std::string::npos || key.find("concrete") != std::string::npos) {
-        return {112, 114, 118};
-    }
-    if (key.find("barrel") != std::string::npos) {
-        return {148, 82, 64};
-    }
-    if (key.find("crate") != std::string::npos) {
-        return {165, 124, 68};
-    }
-    return {160, 164, 170};
+    return prop.previewColor;
 }
 
-constexpr int kMapFormatVersion = 4;
+constexpr int kMapFormatVersion = 5;
 
 std::filesystem::path brushModelPath() {
-    return "assets/generated/models/crate.obj";
+    return "generated/models/crate.obj";
 }
 
 std::filesystem::path brushMaterialPath(const std::string_view materialId) {
     if (materialId == "bomb_site_a") {
-        return "assets/generated/materials/bomb_site_a.mat";
+        return "generated/materials/bomb_site_a.mat";
     }
     if (materialId == "bomb_site_b") {
-        return "assets/generated/materials/bomb_site_b.mat";
+        return "generated/materials/bomb_site_b.mat";
     }
     if (materialId == "floor_concrete") {
-        return "assets/generated/materials/polyhaven_concrete_floor.mat";
+        return "generated/materials/polyhaven_concrete_floor.mat";
     }
-    return "assets/generated/materials/polyhaven_concrete_wall_006.mat";
+    return "generated/materials/polyhaven_concrete_wall_006.mat";
 }
 
 MapProp makeBrushProp(const std::string& id,
@@ -156,11 +127,33 @@ MapProp makeBrushProp(const std::string& id,
                       const util::Vec3& scale,
                       const std::filesystem::path& materialPath,
                       const util::Vec3& rotationDegrees = {}) {
+    util::ColorRgb8 previewColor{112, 114, 118};
+    std::string label = "盒体墙";
+    std::string category = "结构";
+    if (id == "editor_brush_floor") {
+        previewColor = {92, 100, 84};
+        label = "地面盒体";
+    } else if (id == "bomb_site_a") {
+        previewColor = {174, 72, 56};
+        label = "A 爆点标记";
+        category = "标记";
+    } else if (id == "bomb_site_b") {
+        previewColor = {62, 96, 172};
+        label = "B 爆点标记";
+        category = "标记";
+    }
+
     return MapProp{
         .id = id,
         .position = position,
         .modelPath = brushModelPath(),
         .materialPath = materialPath,
+        .label = label,
+        .category = category,
+        .collisionHalfExtents = {0.50f, 0.50f, 0.50f},
+        .collisionCenterOffset = {0.0f, 0.50f, 0.0f},
+        .previewColor = previewColor,
+        .cylindricalFootprint = false,
         .rotationDegrees = rotationDegrees,
         .scale = scale,
     };
@@ -171,19 +164,19 @@ void addPerimeterBrushes(MapData& map, const std::string& materialId, const floa
     const float width = static_cast<float>(map.width);
     const float depth = static_cast<float>(map.depth);
     const auto materialPath = brushMaterialPath(materialId);
-    map.props.push_back(makeBrushProp("editor_brush_perimeter_west",
+    map.props.push_back(makeBrushProp("editor_brush_wall",
         {kWallThickness * 0.5f, 0.0f, depth * 0.5f},
         {kWallThickness, wallHeight, depth},
         materialPath));
-    map.props.push_back(makeBrushProp("editor_brush_perimeter_east",
+    map.props.push_back(makeBrushProp("editor_brush_wall",
         {width - kWallThickness * 0.5f, 0.0f, depth * 0.5f},
         {kWallThickness, wallHeight, depth},
         materialPath));
-    map.props.push_back(makeBrushProp("editor_brush_perimeter_north",
+    map.props.push_back(makeBrushProp("editor_brush_wall",
         {width * 0.5f, 0.0f, kWallThickness * 0.5f},
         {width, wallHeight, kWallThickness},
         materialPath));
-    map.props.push_back(makeBrushProp("editor_brush_perimeter_south",
+    map.props.push_back(makeBrushProp("editor_brush_wall",
         {width * 0.5f, 0.0f, depth - kWallThickness * 0.5f},
         {width, wallHeight, kWallThickness},
         materialPath));
@@ -492,9 +485,7 @@ std::string MapSerializer::serialize(const MapData& map) {
         writeVec3Array(out, prop.rotationDegrees);
         out << ", \"scale\": ";
         writeVec3Array(out, prop.scale);
-        out << " },\n";
-        out << "      \"render\": { \"model\": \"" << escapeJsonString(prop.modelPath.generic_string())
-            << "\", \"material\": \"" << escapeJsonString(prop.materialPath.generic_string()) << "\" }\n";
+        out << " }\n";
         out << "    }";
         out << (index + 1 < map.props.size() ? ",\n" : "\n");
     }
@@ -542,8 +533,32 @@ void MapEditor::paintPerimeterWalls(const int wallHeight, const std::string& mat
     addPerimeterBrushes(map_, materialId, static_cast<float>(wallHeight));
 }
 
-void MapEditor::addCrate(const util::Vec3& position, const std::filesystem::path& modelPath, const std::filesystem::path& materialPath) {
-    map_.props.push_back(MapProp{"crate", position, modelPath, materialPath});
+void MapEditor::addObject(const std::string& objectId,
+                          const util::Vec3& position,
+                          const std::filesystem::path& modelPath,
+                          const std::filesystem::path& materialPath) {
+    MapProp prop;
+    prop.id = objectId;
+    prop.position = position;
+    prop.modelPath = modelPath;
+    prop.materialPath = materialPath;
+    if (lowerAscii(objectId).find("barrel") != std::string::npos) {
+        prop.label = "金属油桶";
+        prop.category = "掩体";
+        prop.collisionHalfExtents = {0.34f, 0.55f, 0.34f};
+        prop.collisionCenterOffset = {0.0f, 0.48f, 0.0f};
+        prop.previewColor = {148, 82, 64};
+        prop.cylindricalFootprint = true;
+    } else {
+        prop.label = lowerAscii(objectId).find("classic64") != std::string::npos ? "Classic64 货运箱" : "木箱";
+        prop.category = "掩体";
+        prop.collisionHalfExtents = {0.48f, 0.48f, 0.48f};
+        prop.collisionCenterOffset = {0.0f, 0.48f, 0.0f};
+        prop.previewColor = lowerAscii(objectId).find("classic64") != std::string::npos
+            ? util::ColorRgb8{172, 136, 80}
+            : util::ColorRgb8{165, 124, 68};
+    }
+    map_.props.push_back(std::move(prop));
 }
 
 void MapEditor::addSpawn(const Team team, const util::Vec3& position) {
@@ -569,8 +584,7 @@ bool MapEditor::exportTopDownPreview(const std::filesystem::path& path) const {
                     continue;
                 }
                 hasProp = true;
-                const std::string key = lowerAscii(prop.id + " " + prop.modelPath.generic_string());
-                hasBarrel = key.find("barrel") != std::string::npos;
+                hasBarrel = prop.cylindricalFootprint;
                 propColor = previewPropColor(prop);
                 break;
             }
@@ -607,17 +621,17 @@ MapData makeDefaultBombDefusalMap(const std::filesystem::path& assetRoot) {
     editor.paintPerimeterWalls(3, "wall_concrete");
     editor.addSpawn(Team::Attackers, {3.0f, 1.0f, 3.0f});
     editor.addSpawn(Team::Defenders, {20.0f, 1.0f, 20.0f});
-    editor.addCrate({7.0f, 0.0f, 7.0f}, crateModel, crateMaterial);
-    editor.addCrate({8.0f, 0.0f, 7.0f}, crateModel, crateMaterial);
-    editor.addCrate({16.0f, 0.0f, 14.0f}, crateModel, crateMaterial);
+    editor.addObject("wooden_crate", {7.0f, 0.0f, 7.0f}, crateModel, crateMaterial);
+    editor.addObject("wooden_crate", {8.0f, 0.0f, 7.0f}, crateModel, crateMaterial);
+    editor.addObject("wooden_crate", {16.0f, 0.0f, 14.0f}, crateModel, crateMaterial);
 
     auto& map = editor.map();
-    map.props.push_back(MapProp{"barrel_02", {10.5f, 0.0f, 8.5f}, barrelModel, barrelMaterial});
-    map.props.push_back(MapProp{"barrel_02", {15.5f, 0.0f, 15.5f}, barrelModel, barrelMaterial});
-    map.props.push_back(MapProp{"crate_stack", {11.5f, 0.0f, 16.5f}, crateModel, crateMaterial});
+    editor.addObject("barrel_02", {10.5f, 0.0f, 8.5f}, barrelModel, barrelMaterial);
+    editor.addObject("barrel_02", {15.5f, 0.0f, 15.5f}, barrelModel, barrelMaterial);
+    editor.addObject("wooden_crate", {11.5f, 0.0f, 16.5f}, crateModel, crateMaterial);
     if (util::FileSystem::exists(classicCrateMaterial)) {
-        map.props.push_back(MapProp{"classic64_crate", {5.0f, 0.0f, 15.0f}, crateModel, classicCrateMaterial});
-        map.props.push_back(MapProp{"classic64_crate", {5.9f, 0.0f, 15.0f}, crateModel, classicCrateMaterial});
+        editor.addObject("classic64_crate", {5.0f, 0.0f, 15.0f}, crateModel, classicCrateMaterial);
+        editor.addObject("classic64_crate", {5.9f, 0.0f, 15.0f}, crateModel, classicCrateMaterial);
     }
     addSiteMarker(map, "bomb_site_a", {12.0f, 0.001f, 12.0f}, {2.2f, 0.02f, 2.2f});
     addSiteMarker(map, "bomb_site_b", {19.0f, 0.001f, 7.0f}, {2.2f, 0.02f, 2.2f});
@@ -648,17 +662,28 @@ MapData makeMetroStationShowcaseMap(const std::filesystem::path& assetRoot) {
 
     auto& map = editor.map();
     if (util::FileSystem::exists(metroModel)) {
-        map.props.push_back(MapProp{"metro_psx_station", {22.0f, -1.45f, 22.0f}, metroModel, {}});
+        map.props.push_back(MapProp{
+            .id = "metro_psx_station",
+            .position = {22.0f, -1.45f, 22.0f},
+            .modelPath = metroModel,
+            .materialPath = {},
+            .label = "Metro 站台结构",
+            .category = "场景",
+            .collisionHalfExtents = {5.0f, 2.5f, 5.0f},
+            .collisionCenterOffset = {0.0f, 1.0f, 0.0f},
+            .previewColor = {120, 126, 134},
+            .cylindricalFootprint = false,
+        });
     }
     if (util::FileSystem::exists(crateMaterial)) {
-        map.props.push_back(MapProp{"classic64_crate", {14.5f, 0.0f, 18.5f}, crateModel, crateMaterial});
-        map.props.push_back(MapProp{"classic64_crate", {15.4f, 0.0f, 18.5f}, crateModel, crateMaterial});
-        map.props.push_back(MapProp{"classic64_crate", {16.3f, 0.0f, 18.5f}, crateModel, crateMaterial});
-        map.props.push_back(MapProp{"classic64_crate", {12.8f, 0.0f, 84.2f}, crateModel, crateMaterial});
-        map.props.push_back(MapProp{"classic64_crate", {13.7f, 0.0f, 84.2f}, crateModel, crateMaterial});
+        editor.addObject("classic64_crate", {14.5f, 0.0f, 18.5f}, crateModel, crateMaterial);
+        editor.addObject("classic64_crate", {15.4f, 0.0f, 18.5f}, crateModel, crateMaterial);
+        editor.addObject("classic64_crate", {16.3f, 0.0f, 18.5f}, crateModel, crateMaterial);
+        editor.addObject("classic64_crate", {12.8f, 0.0f, 84.2f}, crateModel, crateMaterial);
+        editor.addObject("classic64_crate", {13.7f, 0.0f, 84.2f}, crateModel, crateMaterial);
     }
-    map.props.push_back(MapProp{"barrel_02", {12.5f, 0.0f, 22.5f}, barrelModel, barrelMaterial});
-    map.props.push_back(MapProp{"barrel_02", {21.5f, 0.0f, 81.5f}, barrelModel, barrelMaterial});
+    editor.addObject("barrel_02", {12.5f, 0.0f, 22.5f}, barrelModel, barrelMaterial);
+    editor.addObject("barrel_02", {21.5f, 0.0f, 81.5f}, barrelModel, barrelMaterial);
     addSiteMarker(map, "bomb_site_a", {17.0f, 0.001f, 45.0f}, {2.2f, 0.02f, 2.2f});
     addSiteMarker(map, "bomb_site_b", {19.0f, 0.001f, 73.0f}, {2.2f, 0.02f, 2.2f});
     map.lights.push_back(LightProbe{{18.0f, 7.5f, 18.0f}, {1.0f, 0.95f, 0.86f}, 10.5f});

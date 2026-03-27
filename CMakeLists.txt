@@ -74,7 +74,9 @@ set(MYCSGO_APP_SOURCES
     src/app/Settings.cpp
     src/app/MainMenu.cpp
     src/audio/AudioSystem.cpp
+    src/content/AssetManifest.cpp
     src/content/GameContent.cpp
+    src/content/ObjectCatalog.cpp
     src/gameplay/MapData.cpp
     src/gameplay/PhysicsWorld.cpp
     src/gameplay/Simulation.cpp

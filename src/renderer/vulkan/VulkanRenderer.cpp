@@ -62,6 +62,24 @@ namespace mycsg::renderer {
 
 namespace {
 
+std::string lowerAsciiCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+std::string joinTags(const std::vector<std::string>& tags) {
+    std::string joined;
+    for (std::size_t index = 0; index < tags.size(); ++index) {
+        if (index > 0) {
+            joined += " / ";
+        }
+        joined += tags[index];
+    }
+    return joined;
+}
+
 class VulkanDispatch {
 public:
     bool loadLoader() {
@@ -184,6 +202,7 @@ public:
         vkResetFences = loadDevice<PFN_vkResetFences>("vkResetFences");
         vkAcquireNextImageKHR = loadDevice<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR");
         vkQueueSubmit = loadDevice<PFN_vkQueueSubmit>("vkQueueSubmit");
+        vkQueueWaitIdle = loadDevice<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
         vkQueuePresentKHR = loadDevice<PFN_vkQueuePresentKHR>("vkQueuePresentKHR");
         vkDeviceWaitIdle = loadDevice<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
         return vkDestroyDevice != nullptr &&
@@ -250,6 +269,7 @@ public:
                vkResetFences != nullptr &&
                vkAcquireNextImageKHR != nullptr &&
                vkQueueSubmit != nullptr &&
+               vkQueueWaitIdle != nullptr &&
                vkQueuePresentKHR != nullptr &&
                vkDeviceWaitIdle != nullptr;
     }
@@ -388,6 +408,7 @@ public:
     PFN_vkResetFences vkResetFences = nullptr;
     PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR = nullptr;
     PFN_vkQueueSubmit vkQueueSubmit = nullptr;
+    PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
     PFN_vkQueuePresentKHR vkQueuePresentKHR = nullptr;
     PFN_vkDeviceWaitIdle vkDeviceWaitIdle = nullptr;
 };
@@ -407,6 +428,12 @@ struct GpuBuffer {
     std::uint32_t vertexCount = 0;
     util::Vec3 center{};
     float radius = 1.0f;
+};
+
+struct GpuInstanceBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    std::uint32_t instanceCount = 0;
 };
 
 struct TextureResource {
@@ -461,6 +488,17 @@ struct MeshPushConstants {
     std::array<float, 16> model{};
 };
 
+struct MeshInstancePushConstants {
+    std::array<float, 16> projectionView{};
+};
+
+struct MeshInstanceVertex {
+    std::array<float, 4> modelRow0{};
+    std::array<float, 4> modelRow1{};
+    std::array<float, 4> modelRow2{};
+    std::array<float, 4> modelRow3{};
+};
+
 struct TextVertex {
     float x = 0.0f;
     float y = 0.0f;
@@ -488,6 +526,12 @@ MeshPushConstants makePushConstants(const glm::mat4& projectionView, const glm::
     MeshPushConstants push{};
     std::memcpy(push.mvp.data(), glm::value_ptr(mvp), sizeof(push.mvp));
     std::memcpy(push.model.data(), glm::value_ptr(model), sizeof(push.model));
+    return push;
+}
+
+MeshInstancePushConstants makeInstancePushConstants(const glm::mat4& projectionView) {
+    MeshInstancePushConstants push{};
+    std::memcpy(push.projectionView.data(), glm::value_ptr(projectionView), sizeof(push.projectionView));
     return push;
 }
 
@@ -884,10 +928,12 @@ bool isBlockedCell(const gameplay::MapData& map, const int cellX, const int cell
     const float sampleX = static_cast<float>(cellX) + 0.5f;
     const float sampleZ = static_cast<float>(cellZ) + 0.5f;
     for (const auto& prop : map.props) {
-        const std::string key = toLowerAscii(prop.id + " " + prop.modelPath.generic_string());
+        const std::string key = toLowerAscii(prop.id + " " + prop.category);
         if (key.find("wall") == std::string::npos &&
-            key.find("perimeter") == std::string::npos &&
-            key.find("cover") == std::string::npos) {
+            key.find("掩体") == std::string::npos &&
+            key.find("结构") == std::string::npos &&
+            key.find("crate") == std::string::npos &&
+            key.find("barrel") == std::string::npos) {
             continue;
         }
         const util::Vec3 half = editorPropOutlineHalfExtents(prop);
@@ -914,26 +960,6 @@ std::string toLowerAscii(std::string value) {
     return value;
 }
 
-std::string describeEditorPropLabel(const gameplay::MapProp& prop) {
-    const std::string key = toLowerAscii(prop.id + " " + prop.modelPath.generic_string());
-    if (key.find("editor_brush_floor") != std::string::npos) {
-        return "地面盒体";
-    }
-    if (key.find("editor_brush_perimeter") != std::string::npos) {
-        return "边界墙";
-    }
-    if (key.find("editor_brush_wall") != std::string::npos) {
-        return "盒体墙";
-    }
-    if (key.find("barrel") != std::string::npos) {
-        return "金属油桶";
-    }
-    if (key.find("crate") != std::string::npos) {
-        return "木箱";
-    }
-    return prop.id.empty() ? "道具" : prop.id;
-}
-
 struct PropVisualProfile {
     enum class Shape {
         Generic,
@@ -950,28 +976,29 @@ struct PropVisualProfile {
 };
 
 PropVisualProfile describeProp(const gameplay::MapProp& prop) {
-    const std::string key = toLowerAscii(prop.id + " " + prop.modelPath.generic_string() + " " + prop.materialPath.generic_string());
-    if (key.find("barrel") != std::string::npos) {
+    if (prop.cylindricalFootprint) {
         return PropVisualProfile{
             .shape = PropVisualProfile::Shape::Barrel,
             .spriteHeightScale = 0.98f,
             .spriteWidthScale = 0.52f,
-            .body = RGB(148, 82, 64),
+            .body = RGB(prop.previewColor.r, prop.previewColor.g, prop.previewColor.b),
             .accent = RGB(196, 156, 122),
             .detail = RGB(88, 48, 36),
         };
     }
-    if (key.find("crate") != std::string::npos) {
+    if (toLowerAscii(prop.id).find("crate") != std::string::npos) {
         return PropVisualProfile{
             .shape = PropVisualProfile::Shape::Crate,
             .spriteHeightScale = 0.90f,
             .spriteWidthScale = 0.76f,
-            .body = RGB(154, 116, 78),
+            .body = RGB(prop.previewColor.r, prop.previewColor.g, prop.previewColor.b),
             .accent = RGB(204, 170, 120),
             .detail = RGB(94, 68, 46),
         };
     }
-    return {};
+    PropVisualProfile profile{};
+    profile.body = RGB(prop.previewColor.r, prop.previewColor.g, prop.previewColor.b);
+    return profile;
 }
 
 glm::mat4 buildPropModelMatrix(const gameplay::MapProp& prop) {
@@ -988,38 +1015,118 @@ glm::mat4 buildPropModelMatrix(const gameplay::MapProp& prop) {
         glm::scale(glm::mat4(1.0f), propScale);
 }
 
-util::Vec3 editorPropOutlineHalfExtents(const gameplay::MapProp& prop) {
+std::string buildStaticPropBatchGroupKey(const gameplay::MapProp& prop) {
+    const std::string materialKey = prop.materialPath.lexically_normal().generic_string();
+    return materialKey.empty() ? "__default__" : materialKey;
+}
+
+std::string buildStaticPropInstanceGroupKey(const gameplay::MapProp& prop) {
+    const std::string modelKey = prop.modelPath.lexically_normal().generic_string();
+    const std::string materialKey = prop.materialPath.lexically_normal().generic_string();
+    return modelKey + "|" + materialKey;
+}
+
+std::string buildStaticPropBatchCacheKey(const gameplay::MapData& map) {
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(3);
+    stream << map.props.size() << '|';
+    for (const auto& prop : map.props) {
+        stream << prop.id << '|'
+               << prop.modelPath.lexically_normal().generic_string() << '|'
+               << prop.materialPath.lexically_normal().generic_string() << '|'
+               << prop.position.x << ',' << prop.position.y << ',' << prop.position.z << '|'
+               << prop.rotationDegrees.x << ',' << prop.rotationDegrees.y << ',' << prop.rotationDegrees.z << '|'
+               << prop.scale.x << ',' << prop.scale.y << ',' << prop.scale.z << ';';
+    }
+    return stream.str();
+}
+
+void appendTransformedCpuMesh(vulkan::CpuMesh& target,
+                              const vulkan::CpuMesh& source,
+                              const glm::mat4& modelMatrix) {
+    const glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelMatrix)));
+    target.vertices.reserve(target.vertices.size() + source.vertices.size());
+    for (const auto& vertex : source.vertices) {
+        const glm::vec4 transformedPosition = modelMatrix * glm::vec4(vertex.px, vertex.py, vertex.pz, 1.0f);
+        const glm::vec3 transformedNormal = glm::normalize(normalMatrix * glm::vec3(vertex.nx, vertex.ny, vertex.nz));
+        target.vertices.push_back({
+            transformedPosition.x,
+            transformedPosition.y,
+            transformedPosition.z,
+            transformedNormal.x,
+            transformedNormal.y,
+            transformedNormal.z,
+            vertex.u,
+            vertex.v,
+            vertex.r,
+            vertex.g,
+            vertex.b,
+        });
+    }
+}
+
+MeshInstanceVertex makeMeshInstanceVertex(const glm::mat4& modelMatrix) {
+    MeshInstanceVertex instance{};
+    for (int row = 0; row < 4; ++row) {
+        instance.modelRow0[static_cast<std::size_t>(row)] = modelMatrix[0][row];
+        instance.modelRow1[static_cast<std::size_t>(row)] = modelMatrix[1][row];
+        instance.modelRow2[static_cast<std::size_t>(row)] = modelMatrix[2][row];
+        instance.modelRow3[static_cast<std::size_t>(row)] = modelMatrix[3][row];
+    }
+    return instance;
+}
+
+bool shouldInstanceStaticPropGroup(const gameplay::MapProp& prop, const std::size_t instanceCount) {
+    if (prop.modelPath.empty()) {
+        return false;
+    }
+    if (instanceCount < 2) {
+        return false;
+    }
+
     const std::string key = toLowerAscii(prop.id + " " + prop.modelPath.generic_string());
-    if (key.find("editor_brush") != std::string::npos ||
-        toLowerAscii(prop.modelPath.filename().string()) == "crate.obj") {
-        return {
-            0.50f * std::max(0.001f, std::abs(prop.scale.x)),
-            0.50f * std::max(0.001f, std::abs(prop.scale.y)),
-            0.50f * std::max(0.001f, std::abs(prop.scale.z)),
-        };
+    if (key.find("editor_brush") != std::string::npos) {
+        return false;
     }
-    const auto profile = describeProp(prop);
-    switch (profile.shape) {
-        case PropVisualProfile::Shape::Barrel:
-            return {
-                0.34f * std::max(0.001f, std::abs(prop.scale.x)),
-                0.55f * std::max(0.001f, std::abs(prop.scale.y)),
-                0.34f * std::max(0.001f, std::abs(prop.scale.z)),
-            };
-        case PropVisualProfile::Shape::Crate:
-            return {
-                0.48f * std::max(0.001f, std::abs(prop.scale.x)),
-                0.48f * std::max(0.001f, std::abs(prop.scale.y)),
-                0.48f * std::max(0.001f, std::abs(prop.scale.z)),
-            };
-        case PropVisualProfile::Shape::Generic:
-        default:
-            return {
-                0.42f * std::max(0.001f, std::abs(prop.scale.x)),
-                0.52f * std::max(0.001f, std::abs(prop.scale.y)),
-                0.42f * std::max(0.001f, std::abs(prop.scale.z)),
-            };
+    return true;
+}
+
+void finalizeMergedCpuMeshBounds(vulkan::CpuMesh& mesh) {
+    if (mesh.vertices.empty()) {
+        mesh.valid = false;
+        mesh.center = {};
+        mesh.radius = 1.0f;
+        return;
     }
+
+    util::Vec3 min{mesh.vertices.front().px, mesh.vertices.front().py, mesh.vertices.front().pz};
+    util::Vec3 max = min;
+    for (const auto& vertex : mesh.vertices) {
+        min.x = std::min(min.x, vertex.px);
+        min.y = std::min(min.y, vertex.py);
+        min.z = std::min(min.z, vertex.pz);
+        max.x = std::max(max.x, vertex.px);
+        max.y = std::max(max.y, vertex.py);
+        max.z = std::max(max.z, vertex.pz);
+    }
+
+    mesh.center = {(min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f, (min.z + max.z) * 0.5f};
+    mesh.radius = 0.001f;
+    for (const auto& vertex : mesh.vertices) {
+        const float dx = vertex.px - mesh.center.x;
+        const float dy = vertex.py - mesh.center.y;
+        const float dz = vertex.pz - mesh.center.z;
+        mesh.radius = std::max(mesh.radius, std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    mesh.valid = true;
+}
+
+util::Vec3 editorPropOutlineHalfExtents(const gameplay::MapProp& prop) {
+    return {
+        std::max(0.01f, prop.collisionHalfExtents.x) * std::max(0.001f, std::abs(prop.scale.x)),
+        std::max(0.01f, prop.collisionHalfExtents.y) * std::max(0.001f, std::abs(prop.scale.y)),
+        std::max(0.01f, prop.collisionHalfExtents.z) * std::max(0.001f, std::abs(prop.scale.z)),
+    };
 }
 
 std::string staticWorldMeshCacheKey(const gameplay::MapData& map) {
@@ -1133,6 +1240,38 @@ std::array<util::Vec3, 8> buildEditorPropOutlineCorners(const gameplay::MapProp&
     return worldCorners;
 }
 
+std::array<util::Vec3, 8> buildMeshBoundingBoxCorners(const glm::mat4& model,
+                                                      const vulkan::CpuMesh& mesh) {
+    util::Vec3 min{mesh.vertices.front().px, mesh.vertices.front().py, mesh.vertices.front().pz};
+    util::Vec3 max = min;
+    for (const auto& vertex : mesh.vertices) {
+        min.x = std::min(min.x, vertex.px);
+        min.y = std::min(min.y, vertex.py);
+        min.z = std::min(min.z, vertex.pz);
+        max.x = std::max(max.x, vertex.px);
+        max.y = std::max(max.y, vertex.py);
+        max.z = std::max(max.z, vertex.pz);
+    }
+
+    const std::array<glm::vec3, 8> localCorners{{
+        {min.x, min.y, min.z},
+        {max.x, min.y, min.z},
+        {min.x, max.y, min.z},
+        {max.x, max.y, min.z},
+        {min.x, min.y, max.z},
+        {max.x, min.y, max.z},
+        {min.x, max.y, max.z},
+        {max.x, max.y, max.z},
+    }};
+
+    std::array<util::Vec3, 8> worldCorners{};
+    for (std::size_t index = 0; index < localCorners.size(); ++index) {
+        const glm::vec4 world = model * glm::vec4(localCorners[index], 1.0f);
+        worldCorners[index] = {world.x, world.y, world.z};
+    }
+    return worldCorners;
+}
+
 void recordProjectedLine(VulkanDispatch& dispatch,
                          const VkCommandBuffer commandBuffer,
                          const VkExtent2D extent,
@@ -1207,6 +1346,39 @@ bool recordPropOutline(VulkanDispatch& dispatch,
     }
     if (outMidX != nullptr) {
         *outMidX = (minX + maxX) * 0.5f;
+    }
+    return true;
+}
+
+bool recordProjectedBoundingBox(VulkanDispatch& dispatch,
+                                const VkCommandBuffer commandBuffer,
+                                const VkExtent2D extent,
+                                const glm::mat4& projectionView,
+                                const std::array<util::Vec3, 8>& worldCorners,
+                                const VkClearAttachment& attachment,
+                                const float thicknessPx) {
+    std::array<ProjectedVertex, 8> projectedCorners{};
+    for (std::size_t index = 0; index < worldCorners.size(); ++index) {
+        const auto projected = projectWorldPoint(
+            projectionView,
+            worldCorners[index],
+            static_cast<float>(extent.width),
+            static_cast<float>(extent.height));
+        if (!projected.has_value()) {
+            return false;
+        }
+        projectedCorners[index] = *projected;
+    }
+
+    static constexpr std::array<std::array<int, 2>, 12> kEdges{{
+        {{0, 1}}, {{1, 3}}, {{3, 2}}, {{2, 0}},
+        {{4, 5}}, {{5, 7}}, {{7, 6}}, {{6, 4}},
+        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+    }};
+    for (const auto& edge : kEdges) {
+        const auto& a = projectedCorners[static_cast<std::size_t>(edge[0])];
+        const auto& b = projectedCorners[static_cast<std::size_t>(edge[1])];
+        recordProjectedLine(dispatch, commandBuffer, extent, attachment, a.x, a.y, b.x, b.y, thicknessPx);
     }
     return true;
 }
@@ -1480,6 +1652,18 @@ public:
         shutdownImGui();
         destroyMeshResources();
         destroySwapchainResources();
+        if (textureSampler_ != VK_NULL_HANDLE && dispatch_.vkDestroySampler != nullptr) {
+            dispatch_.vkDestroySampler(device_, textureSampler_, nullptr);
+            textureSampler_ = VK_NULL_HANDLE;
+        }
+        if (textureDescriptorPool_ != VK_NULL_HANDLE && dispatch_.vkDestroyDescriptorPool != nullptr) {
+            dispatch_.vkDestroyDescriptorPool(device_, textureDescriptorPool_, nullptr);
+            textureDescriptorPool_ = VK_NULL_HANDLE;
+        }
+        if (textureDescriptorSetLayout_ != VK_NULL_HANDLE && dispatch_.vkDestroyDescriptorSetLayout != nullptr) {
+            dispatch_.vkDestroyDescriptorSetLayout(device_, textureDescriptorSetLayout_, nullptr);
+            textureDescriptorSetLayout_ = VK_NULL_HANDLE;
+        }
 
         if (renderFence_ != VK_NULL_HANDLE && dispatch_.vkDestroyFence != nullptr) {
             dispatch_.vkDestroyFence(device_, renderFence_, nullptr);
@@ -1529,627 +1713,26 @@ private:
         TextureResource texture;
     };
 
-    std::array<float, 4> textColor(const VkClearAttachment& attachment) const {
-        return {
-            attachment.clearValue.color.float32[0],
-            attachment.clearValue.color.float32[1],
-            attachment.clearValue.color.float32[2],
-            attachment.clearValue.color.float32[3],
-        };
-    }
+    struct CachedImGuiPreviewTexture {
+        std::string path;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    };
 
-    static void processNativeEvent(const void* event, void* userData) {
-        if (event == nullptr || userData == nullptr) {
-            return;
-        }
+    struct StaticPropBatch {
+        std::string key;
+        std::filesystem::path materialPath;
+        GpuBuffer buffer;
+        std::size_t propCount = 0;
+    };
 
-        auto* renderer = static_cast<VulkanRenderer*>(userData);
-        if (!renderer->imguiInitialized_) {
-            return;
-        }
-        ImGui_ImplSDL3_ProcessEvent(static_cast<const SDL_Event*>(event));
-    }
-
-    static PFN_vkVoidFunction loadImGuiFunction(const char* functionName, void* userData) {
-        if (functionName == nullptr || userData == nullptr) {
-            return nullptr;
-        }
-        return static_cast<VulkanDispatch*>(userData)->loadAny(functionName);
-    }
-
-    bool initializeImGui(platform::IWindow& window) {
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        io.ConfigWindowsMoveFromTitleBarOnly = true;
-        io.IniFilename = "imgui.ini";
-        applyImGuiStyle();
-
-        std::filesystem::path fontPath = resolveImGuiFontPath();
-        ImFontConfig fontConfig{};
-        fontConfig.OversampleH = 2;
-        fontConfig.OversampleV = 2;
-        fontConfig.RasterizerMultiply = 1.05f;
-        static const ImWchar glyphRanges[] = {
-            0x0020, 0x00FF,
-            0x2000, 0x206F,
-            0x3000, 0x30FF,
-            0x4E00, 0x9FFF,
-            0,
-        };
-        if (!fontPath.empty()) {
-            if (io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 20.0f, &fontConfig, glyphRanges) != nullptr) {
-                spdlog::info("[ImGui] Loaded UI font: {}", fontPath.generic_string());
-            } else {
-                spdlog::warn("[ImGui] Failed to load UI font: {}", fontPath.generic_string());
-            }
-        }
-        if (io.Fonts->Fonts.empty()) {
-            io.Fonts->AddFontDefault();
-            spdlog::warn("[ImGui] Falling back to default font; Chinese glyph coverage may be limited.");
-        }
-
-        if (!ImGui_ImplSDL3_InitForVulkan(sdlWindow_)) {
-            spdlog::error("[ImGui] Failed to initialize SDL3 backend.");
-            ImGui::DestroyContext();
-            return false;
-        }
-        window.setNativeEventObserver({&VulkanRenderer::processNativeEvent, this});
-
-        if (!ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_0, &VulkanRenderer::loadImGuiFunction, &dispatch_)) {
-            spdlog::error("[ImGui] Failed to load Vulkan function table.");
-            window.setNativeEventObserver({});
-            ImGui_ImplSDL3_Shutdown();
-            ImGui::DestroyContext();
-            return false;
-        }
-
-        ImGui_ImplVulkan_InitInfo initInfo{};
-        initInfo.ApiVersion = VK_API_VERSION_1_0;
-        initInfo.Instance = instance_;
-        initInfo.PhysicalDevice = physicalDevice_;
-        initInfo.Device = device_;
-        initInfo.QueueFamily = queueFamilyIndex_;
-        initInfo.Queue = graphicsQueue_;
-        initInfo.DescriptorPoolSize = 96;
-        initInfo.MinImageCount = static_cast<std::uint32_t>(std::max<std::size_t>(2, frames_.size()));
-        initInfo.ImageCount = static_cast<std::uint32_t>(frames_.size());
-        initInfo.PipelineInfoMain.RenderPass = renderPass_;
-        initInfo.PipelineInfoMain.Subpass = 0;
-        initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-        initInfo.UseDynamicRendering = false;
-        initInfo.MinAllocationSize = 1024 * 1024;
-        initInfo.CheckVkResultFn = [](VkResult result) {
-            if (result != VK_SUCCESS) {
-                spdlog::warn("[ImGui] Vulkan backend reported result {}", static_cast<int>(result));
-            }
-        };
-        if (!ImGui_ImplVulkan_Init(&initInfo)) {
-            spdlog::error("[ImGui] Failed to initialize Vulkan backend.");
-            window.setNativeEventObserver({});
-            ImGui_ImplSDL3_Shutdown();
-            ImGui::DestroyContext();
-            return false;
-        }
-
-        imguiInitialized_ = true;
-        imguiKeyboardCapture_ = false;
-        imguiMouseCapture_ = false;
-        return true;
-    }
-
-    void shutdownImGui() {
-        if (!imguiInitialized_) {
-            return;
-        }
-
-        imguiKeyboardCapture_ = false;
-        imguiMouseCapture_ = false;
-        ImGui_ImplVulkan_Shutdown();
-        ImGui_ImplSDL3_Shutdown();
-        ImGui::DestroyContext();
-        imguiInitialized_ = false;
-    }
-
-    void beginImGuiFrame(const RenderFrame& renderFrame) {
-        if (!imguiInitialized_) {
-            imguiKeyboardCapture_ = false;
-            imguiMouseCapture_ = false;
-            return;
-        }
-
-        ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
-
-        buildImGuiWindows(renderFrame);
-        ImGuiIO& io = ImGui::GetIO();
-        imguiKeyboardCapture_ = io.WantCaptureKeyboard;
-        imguiMouseCapture_ = io.WantCaptureMouse;
-        ImGui::Render();
-    }
-
-    void queueUiAction(const UiActionType type, const std::int32_t value0 = 0, const std::int32_t value1 = 0) {
-        pendingUiActions_.push_back(UiAction{
-            .type = type,
-            .value0 = value0,
-            .value1 = value1,
-            .text = {},
-            .vectorValue = {},
-        });
-    }
-
-    void queueUiTextAction(const UiActionType type, std::string text) {
-        pendingUiActions_.push_back(UiAction{
-            .type = type,
-            .text = std::move(text),
-            .vectorValue = {},
-        });
-    }
-
-    void queueUiVec3Action(const UiActionType type, const util::Vec3& vectorValue) {
-        pendingUiActions_.push_back(UiAction{
-            .type = type,
-            .text = {},
-            .vectorValue = vectorValue,
-        });
-    }
-
-    void copyStringToBuffer(std::array<char, 128>& buffer, const std::string& value) {
-        buffer.fill('\0');
-        const std::size_t count = std::min(buffer.size() - 1, value.size());
-        std::memcpy(buffer.data(), value.data(), count);
-    }
-
-    void syncMultiplayerDraft(const RenderFrame& renderFrame) {
-        if (multiplayerDraftInitialized_) {
-            return;
-        }
-        multiplayerDraftInitialized_ = true;
-        multiplayerSessionTypeDraft_ = renderFrame.multiplayerSessionTypeIndex;
-        multiplayerPortDraft_ = renderFrame.multiplayerPort;
-        multiplayerMaxPlayersDraft_ = renderFrame.multiplayerMaxPlayers;
-        copyStringToBuffer(multiplayerHostDraft_, renderFrame.multiplayerHost);
-    }
-
-    void emitMultiplayerDraftChanges(const RenderFrame& renderFrame) {
-        if (multiplayerSessionTypeDraft_ != renderFrame.multiplayerSessionTypeIndex) {
-            queueUiAction(UiActionType::SetMultiplayerSessionType, multiplayerSessionTypeDraft_);
-        }
-
-        const std::string draftHost(multiplayerHostDraft_.data());
-        if (draftHost != renderFrame.multiplayerHost) {
-            queueUiTextAction(UiActionType::SetMultiplayerHost, draftHost);
-        }
-
-        if (multiplayerPortDraft_ != renderFrame.multiplayerPort) {
-            queueUiAction(UiActionType::SetMultiplayerPort, multiplayerPortDraft_);
-        }
-
-        if (multiplayerMaxPlayersDraft_ != renderFrame.multiplayerMaxPlayers) {
-            queueUiAction(UiActionType::SetMultiplayerMaxPlayers, multiplayerMaxPlayersDraft_);
-        }
-    }
-
-    void buildImGuiWindows(const RenderFrame& renderFrame) {
-        if (renderFrame.appFlow != app::AppFlow::MultiPlayerLobby &&
-            renderFrame.appFlow != app::AppFlow::MapEditor) {
-            multiplayerDraftInitialized_ = false;
-            return;
-        }
-
-        switch (renderFrame.appFlow) {
-            case app::AppFlow::MultiPlayerLobby:
-            {
-                syncMultiplayerDraft(renderFrame);
-                ImGui::SetNextWindowPos(ImVec2(42.0f, 38.0f), ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(580.0f, 420.0f), ImGuiCond_Always);
-                constexpr ImGuiWindowFlags kMultiplayerWindowFlags =
-                    ImGuiWindowFlags_NoMove |
-                    ImGuiWindowFlags_NoResize |
-                    ImGuiWindowFlags_NoCollapse |
-                    ImGuiWindowFlags_NoSavedSettings;
-                if (ImGui::Begin("联机房间工具", nullptr, kMultiplayerWindowFlags)) {
-                    ImGui::Text("地图  %s", renderFrame.multiplayerMapLabel.c_str());
-                    ImGui::SeparatorText("房间参数");
-
-                    constexpr ImGuiTableFlags kFormTableFlags =
-                        ImGuiTableFlags_SizingFixedFit |
-                        ImGuiTableFlags_BordersInnerV;
-                    if (ImGui::BeginTable("multiplayer_form", 2, kFormTableFlags)) {
-                        ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, 108.0f);
-                        ImGui::TableSetupColumn("control", ImGuiTableColumnFlags_WidthStretch);
-
-                        auto nextFormRow = [](const char* label) {
-                            ImGui::TableNextRow();
-                            ImGui::TableSetColumnIndex(0);
-                            ImGui::AlignTextToFramePadding();
-                            ImGui::TextUnformatted(label);
-                            ImGui::TableSetColumnIndex(1);
-                        };
-
-                        nextFormRow("模式");
-                        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
-                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(18.0f, 10.0f));
-                        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.18f, 0.24f, 0.31f, 0.95f));
-                        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.24f, 0.38f, 0.50f, 0.95f));
-                        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.28f, 0.48f, 0.64f, 1.00f));
-                        ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.98f, 0.86f, 0.48f, 1.00f));
-                        if (ImGui::RadioButton("主机##mp_mode_host", multiplayerSessionTypeDraft_ == 0)) {
-                            multiplayerSessionTypeDraft_ = 0;
-                        }
-                        ImGui::SameLine();
-                        if (ImGui::RadioButton("客户端##mp_mode_client", multiplayerSessionTypeDraft_ == 1)) {
-                            multiplayerSessionTypeDraft_ = 1;
-                        }
-                        ImGui::PopStyleColor(4);
-                        ImGui::PopStyleVar(2);
-
-                        nextFormRow("地图");
-                        const char* currentMapPreview = renderFrame.mapBrowserItems.empty()
-                            ? "没有可用地图"
-                            : renderFrame.mapBrowserItems[std::min(renderFrame.mapBrowserSelectedIndex, renderFrame.mapBrowserItems.size() - 1)].c_str();
-                        const bool hasAnyMap = !renderFrame.mapBrowserItems.empty();
-                        if (!hasAnyMap) {
-                            ImGui::BeginDisabled();
-                        }
-                        if (ImGui::BeginCombo("##mp_map", currentMapPreview)) {
-                            for (std::size_t index = 0; index < renderFrame.mapBrowserItems.size(); ++index) {
-                                const bool selected = index == renderFrame.mapBrowserSelectedIndex;
-                                if (ImGui::Selectable(renderFrame.mapBrowserItems[index].c_str(), selected)) {
-                                    queueUiAction(UiActionType::SelectMapBrowserItem, static_cast<std::int32_t>(index));
-                                }
-                                if (selected) {
-                                    ImGui::SetItemDefaultFocus();
-                                }
-                            }
-                            ImGui::EndCombo();
-                        }
-                        if (!hasAnyMap) {
-                            ImGui::EndDisabled();
-                        }
-
-                        nextFormRow("服务器");
-                        ImGui::SetNextItemWidth(-FLT_MIN);
-                        ImGui::InputTextWithHint("##mp_host", "127.0.0.1", multiplayerHostDraft_.data(), multiplayerHostDraft_.size());
-
-                        nextFormRow("端口");
-                        ImGui::SetNextItemWidth(180.0f);
-                        if (ImGui::InputInt("##mp_port", &multiplayerPortDraft_, 1, 100)) {
-                            multiplayerPortDraft_ = std::clamp(multiplayerPortDraft_, 1, 65535);
-                        }
-
-                        nextFormRow("房间人数");
-                        ImGui::SetNextItemWidth(-FLT_MIN);
-                        ImGui::SliderInt("##mp_max_players", &multiplayerMaxPlayersDraft_, 2, 32, "%d 人");
-
-                        nextFormRow("当前地址");
-                        ImGui::TextUnformatted(renderFrame.multiplayerEndpointLabel.c_str());
-
-                        nextFormRow("状态");
-                        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-                        ImGui::TextUnformatted(renderFrame.multiplayerStatusLabel.c_str());
-                        ImGui::PopTextWrapPos();
-
-                        ImGui::EndTable();
-                    }
-
-                    ImGui::SeparatorText("操作");
-                    const float buttonWidth = (ImGui::GetContentRegionAvail().x - 12.0f) / 3.0f;
-                    if (ImGui::Button("应用网络参数", ImVec2(buttonWidth, 0.0f))) {
-                        emitMultiplayerDraftChanges(renderFrame);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button(renderFrame.multiplayerSessionActive ? "重新启动会话" : "启动会话", ImVec2(buttonWidth, 0.0f))) {
-                        emitMultiplayerDraftChanges(renderFrame);
-                        queueUiAction(UiActionType::ActivateMultiplayerSetting, 3);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("返回主菜单", ImVec2(buttonWidth, 0.0f))) {
-                        queueUiAction(UiActionType::ReturnToMainMenu);
-                    }
-                }
-                ImGui::End();
-                break;
-            }
-            case app::AppFlow::MapEditor:
-            {
-                ImGui::SetNextWindowPos(ImVec2(28.0f, 30.0f), ImGuiCond_Always);
-                ImGui::SetNextWindowSize(ImVec2(540.0f, 760.0f), ImGuiCond_Always);
-                constexpr ImGuiWindowFlags kEditorWindowFlags =
-                    ImGuiWindowFlags_NoMove |
-                    ImGuiWindowFlags_NoResize |
-                    ImGuiWindowFlags_NoCollapse |
-                    ImGuiWindowFlags_NoSavedSettings;
-                if (ImGui::Begin("地图编辑器控制台", nullptr, kEditorWindowFlags)) {
-                    ImGui::Text("地图  %s", renderFrame.editorMapFileLabel.c_str());
-                    ImGui::Text("索引  %zu / %zu", renderFrame.editorMapIndex + 1, std::max<std::size_t>(renderFrame.editorMapCount, 1));
-                    ImGui::Text("视图  %s", renderFrame.editorViewModeLabel.c_str());
-                    ImGui::Text("目标  %.2f, %.2f, %.2f",
-                        renderFrame.editorTargetPosition.x,
-                        renderFrame.editorTargetPosition.y,
-                        renderFrame.editorTargetPosition.z);
-                    ImGui::Text("相机  %.1f, %.1f, %.1f",
-                        renderFrame.cameraPosition.x,
-                        renderFrame.cameraPosition.y,
-                        renderFrame.cameraPosition.z);
-
-                    ImGui::SeparatorText("工具");
-                    static constexpr std::array<const char*, 3> kToolLabels{
-                        "选择",
-                        "放置",
-                        "擦除",
-                    };
-                    for (std::size_t toolIndex = 0; toolIndex < kToolLabels.size(); ++toolIndex) {
-                        if (toolIndex > 0) {
-                            ImGui::SameLine();
-                        }
-                        if (ImGui::Selectable(
-                                kToolLabels[toolIndex],
-                                renderFrame.editorToolLabel == kToolLabels[toolIndex],
-                                0,
-                                ImVec2(92.0f, 0.0f))) {
-                            queueUiAction(UiActionType::SelectMapEditorTool, static_cast<std::int32_t>(toolIndex));
-                        }
-                    }
-
-                    ImGui::SeparatorText("视图");
-                    if (ImGui::Selectable("自由镜头", !renderFrame.editorIsOrthoView, 0, ImVec2(120.0f, 0.0f)) &&
-                        renderFrame.editorIsOrthoView) {
-                        queueUiAction(UiActionType::ToggleMapEditorProjection);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Selectable("2.5D 正交", renderFrame.editorIsOrthoView, 0, ImVec2(120.0f, 0.0f)) &&
-                        !renderFrame.editorIsOrthoView) {
-                        queueUiAction(UiActionType::ToggleMapEditorProjection);
-                    }
-                    ImGui::TextWrapped(
-                        renderFrame.editorIsOrthoView
-                            ? "2.5D 正交视图下使用 WASD 平移，滚轮缩放，Space/Ctrl 也可缩放。"
-                            : "自由镜头下按住右键环视，WASD 飞行，Space/Ctrl 升降。");
-
-                    if (renderFrame.editorToolLabel == "放置") {
-                        ImGui::SeparatorText("放置类型");
-                        static constexpr std::array<const char*, 4> kPlacementLabels{
-                            "盒体墙",
-                            "道具",
-                            "进攻出生点",
-                            "防守出生点",
-                        };
-                        for (std::size_t placementIndex = 0; placementIndex < kPlacementLabels.size(); ++placementIndex) {
-                            if (placementIndex > 0) {
-                                ImGui::SameLine();
-                            }
-                            if (ImGui::Selectable(
-                                    kPlacementLabels[placementIndex],
-                                    renderFrame.editorPlacementKindLabel == kPlacementLabels[placementIndex],
-                                    0,
-                                    ImVec2(placementIndex >= 2 ? 110.0f : 84.0f, 0.0f))) {
-                                queueUiAction(UiActionType::SelectMapEditorPlacementKind, static_cast<std::int32_t>(placementIndex));
-                            }
-                        }
-
-                        if (renderFrame.editorPlacementKindLabel == "盒体墙") {
-                            ImGui::Text("墙体材质: %s", renderFrame.editorWallMaterialLabel.c_str());
-                            static constexpr std::array<const char*, 4> kWallMaterialLabels{
-                                "战术掩体",
-                                "混凝土墙",
-                                "A 点红色标记",
-                                "B 点蓝色标记",
-                            };
-                            for (std::size_t materialIndex = 0; materialIndex < kWallMaterialLabels.size(); ++materialIndex) {
-                                if (materialIndex > 0) {
-                                    ImGui::SameLine();
-                                }
-                                if (ImGui::Selectable(kWallMaterialLabels[materialIndex],
-                                        renderFrame.editorWallMaterialLabel == kWallMaterialLabels[materialIndex],
-                                        0,
-                                        ImVec2(materialIndex == 1 ? 88.0f : 116.0f, 0.0f))) {
-                                    queueUiAction(UiActionType::SelectEditorWallMaterial, static_cast<std::int32_t>(materialIndex));
-                                }
-                            }
-                        } else if (renderFrame.editorPlacementKindLabel == "道具") {
-                            ImGui::Text("道具模板: %s", renderFrame.editorPropPresetLabel.c_str());
-                            static constexpr std::array<const char*, 2> kPropPresetLabels{
-                                "木箱",
-                                "金属油桶",
-                            };
-                            for (std::size_t presetIndex = 0; presetIndex < kPropPresetLabels.size(); ++presetIndex) {
-                                if (presetIndex > 0) {
-                                    ImGui::SameLine();
-                                }
-                                if (ImGui::Selectable(kPropPresetLabels[presetIndex],
-                                        renderFrame.editorPropPresetLabel == kPropPresetLabels[presetIndex],
-                                        0,
-                                        ImVec2(96.0f, 0.0f))) {
-                                    queueUiAction(UiActionType::SelectEditorPropPreset, static_cast<std::int32_t>(presetIndex));
-                                }
-                            }
-                        }
-
-                        ImGui::TextWrapped("光标指中的位置会显示放置虚影。左键或 Enter 立即放置，R 旋转，Tab 切换缩放。");
-                    } else if (renderFrame.editorToolLabel == "选择") {
-                        ImGui::SeparatorText("选择");
-                        if (renderFrame.hoveredEditorPropIndex >= 0) {
-                            ImGui::TextWrapped("当前悬停对象: %s", renderFrame.selectedEditorPropLabel.c_str());
-                        } else if (renderFrame.hoveredEditorSpawnIndex >= 0) {
-                            ImGui::TextWrapped("当前悬停对象: %s", renderFrame.editorCellSpawnLabel.c_str());
-                        } else {
-                            ImGui::TextWrapped("把鼠标指向场景对象即可自动选中。点击不会执行操作。");
-                        }
-                    } else {
-                        ImGui::SeparatorText("擦除");
-                        if (renderFrame.eraseEditorPropIndex >= 0 || renderFrame.eraseEditorSpawnIndex >= 0) {
-                            ImGui::TextColored(ImVec4(0.98f, 0.56f, 0.38f, 1.00f), "当前高亮对象会在点击时被删除。");
-                        } else {
-                            ImGui::TextWrapped("把鼠标移到对象上会显示红色警示高亮，左键即可擦除。");
-                        }
-                    }
-
-                    ImGui::SeparatorText("当前目标");
-                    ImGui::Text("地面: %s", renderFrame.editorCellFloorLabel.c_str());
-                    ImGui::Text("掩体: %s", renderFrame.editorCellCoverLabel.c_str());
-                    ImGui::Text("道具: %s", renderFrame.editorCellPropLabel.c_str());
-                    ImGui::Text("出生点: %s", renderFrame.editorCellSpawnLabel.c_str());
-
-                    ImGui::SeparatorText("对象参数");
-                    if (renderFrame.hasSelectedEditorProp) {
-                        ImGui::Text("名称: %s", renderFrame.selectedEditorPropLabel.c_str());
-                        ImGui::TextWrapped("模型: %s", renderFrame.selectedEditorPropModelLabel.c_str());
-                        ImGui::TextWrapped("材质: %s", renderFrame.selectedEditorPropMaterialLabel.c_str());
-                        if (ImGui::BeginTable("editor-prop-inspector", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV)) {
-                            auto drawVec3Editor = [&](const char* label,
-                                                      const char* widgetId,
-                                                      const util::Vec3& value,
-                                                      const float speed,
-                                                      const float minValue,
-                                                      const float maxValue,
-                                                      const UiActionType actionType,
-                                                      const char* format) {
-                                ImGui::TableNextRow();
-                                ImGui::TableSetColumnIndex(0);
-                                ImGui::AlignTextToFramePadding();
-                                ImGui::TextUnformatted(label);
-                                ImGui::TableSetColumnIndex(1);
-                                float components[3]{value.x, value.y, value.z};
-                                ImGui::SetNextItemWidth(-1.0f);
-                                if (ImGui::DragFloat3(widgetId, components, speed, minValue, maxValue, format)) {
-                                    queueUiVec3Action(actionType, util::Vec3{components[0], components[1], components[2]});
-                                }
-                            };
-
-                            drawVec3Editor("位置", "##selected-prop-position", renderFrame.selectedEditorPropPosition,
-                                0.05f, -64.0f, 128.0f, UiActionType::SetSelectedEditorPropPosition, "%.2f");
-                            drawVec3Editor("旋转", "##selected-prop-rotation", renderFrame.selectedEditorPropRotationDegrees,
-                                1.0f, -360.0f, 360.0f, UiActionType::SetSelectedEditorPropRotation, "%.0f deg");
-                            drawVec3Editor("缩放", "##selected-prop-scale", renderFrame.selectedEditorPropScale,
-                                0.05f, 0.05f, 8.0f, UiActionType::SetSelectedEditorPropScale, "%.2f");
-                            ImGui::EndTable();
-                        }
-                    } else {
-                        ImGui::TextWrapped("当前没有选中的可编辑对象。切到“选择”工具并把鼠标指向场景道具后，这里会显示参数。");
-                    }
-
-                    ImGui::SeparatorText("操作");
-                    const float buttonWidth = (ImGui::GetContentRegionAvail().x - 16.0f) / 3.0f;
-                    if (ImGui::Button("应用工具", ImVec2(buttonWidth, 0.0f))) {
-                        if (renderFrame.editorToolLabel == "擦除") {
-                            queueUiAction(UiActionType::EraseMapEditorCell);
-                        } else if (renderFrame.editorToolLabel != "选择") {
-                            queueUiAction(UiActionType::ApplyMapEditorTool);
-                        }
-                    }
-                    ImGui::SameLine();
-                    if (!renderFrame.editorUndoAvailable) {
-                        ImGui::BeginDisabled();
-                    }
-                    if (ImGui::Button("撤销", ImVec2(buttonWidth, 0.0f))) {
-                        queueUiAction(UiActionType::UndoMapEditorChange);
-                    }
-                    if (!renderFrame.editorUndoAvailable) {
-                        ImGui::EndDisabled();
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("保存地图", ImVec2(buttonWidth, 0.0f))) {
-                        queueUiAction(UiActionType::SaveEditorMap);
-                    }
-                    if (ImGui::Button("上一张地图")) {
-                        queueUiAction(UiActionType::CycleEditorMap, -1);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("下一张地图")) {
-                        queueUiAction(UiActionType::CycleEditorMap, 1);
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button("新建地图")) {
-                        queueUiAction(UiActionType::CreateEditorMap);
-                    }
-                    if (ImGui::Button("返回主菜单")) {
-                        queueUiAction(UiActionType::ReturnToMainMenu);
-                    }
-
-                    ImGui::SeparatorText("统计");
-                    ImGui::Text("道具总数: %d", renderFrame.editorPropCount);
-                    ImGui::Text("出生点总数: %d", renderFrame.editorSpawnCount);
-                    ImGui::Separator();
-                    ImGui::TextWrapped("状态: %s", renderFrame.editorStatusLabel.c_str());
-                }
-                ImGui::End();
-                break;
-            }
-            case app::AppFlow::MainMenu:
-            case app::AppFlow::MapBrowser:
-            case app::AppFlow::Settings:
-            case app::AppFlow::Exit:
-            case app::AppFlow::SinglePlayerLobby:
-                break;
-        }
-    }
-
-    void applyImGuiStyle() {
-        ImGui::StyleColorsDark();
-        ImGuiStyle& style = ImGui::GetStyle();
-        style.WindowRounding = 10.0f;
-        style.ChildRounding = 8.0f;
-        style.FrameRounding = 8.0f;
-        style.GrabRounding = 8.0f;
-        style.PopupRounding = 8.0f;
-        style.ScrollbarRounding = 8.0f;
-        style.TabRounding = 8.0f;
-        style.WindowPadding = ImVec2(14.0f, 12.0f);
-        style.FramePadding = ImVec2(10.0f, 6.0f);
-        style.ItemSpacing = ImVec2(10.0f, 8.0f);
-        style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.10f, 0.13f, 0.92f);
-        style.Colors[ImGuiCol_TitleBg] = ImVec4(0.14f, 0.20f, 0.27f, 1.00f);
-        style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.19f, 0.31f, 0.42f, 1.00f);
-        style.Colors[ImGuiCol_Header] = ImVec4(0.20f, 0.36f, 0.48f, 0.78f);
-        style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.27f, 0.48f, 0.64f, 0.86f);
-        style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.31f, 0.55f, 0.72f, 0.94f);
-        style.Colors[ImGuiCol_Button] = ImVec4(0.21f, 0.42f, 0.56f, 0.76f);
-        style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.30f, 0.54f, 0.71f, 0.92f);
-        style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.35f, 0.60f, 0.78f, 1.00f);
-        style.Colors[ImGuiCol_FrameBg] = ImVec4(0.12f, 0.16f, 0.20f, 0.90f);
-        style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.17f, 0.22f, 0.28f, 0.95f);
-        style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.23f, 0.28f, 0.34f, 1.00f);
-    }
-
-    std::filesystem::path resolveImGuiFontPath() const {
-        std::error_code error;
-        const std::array<std::filesystem::path, 7> candidates{{
-            std::filesystem::path("assets/fonts/NotoSansSC-Variable.ttf"),
-#ifdef MYCSGO_ASSET_ROOT
-            std::filesystem::path(MYCSGO_ASSET_ROOT) / "fonts" / "NotoSansSC-Variable.ttf",
-#else
-            std::filesystem::path(),
-#endif
-#ifdef _WIN32
-            std::filesystem::path("C:/Windows/Fonts/msyh.ttc"),
-            std::filesystem::path("C:/Windows/Fonts/msyh.ttf"),
-            std::filesystem::path("C:/Windows/Fonts/msyhbd.ttc"),
-            std::filesystem::path("C:/Windows/Fonts/simhei.ttf"),
-            std::filesystem::path("C:/Windows/Fonts/simsun.ttc"),
-#else
-            std::filesystem::path(),
-            std::filesystem::path(),
-            std::filesystem::path(),
-            std::filesystem::path(),
-            std::filesystem::path(),
-#endif
-        }};
-
-        for (const auto& candidate : candidates) {
-            if (candidate.empty()) {
-                continue;
-            }
-            if (std::filesystem::exists(candidate, error) && !error) {
-                return candidate;
-            }
-            error.clear();
-        }
-        return {};
-    }
-
+    struct StaticPropInstanceBatch {
+        std::string key;
+        std::filesystem::path modelPath;
+        std::filesystem::path materialPath;
+        GpuInstanceBuffer instances;
+        std::size_t propCount = 0;
+    };
+    #include "VulkanRendererImGui.inl"
     bool buildUiFontAtlas(std::vector<unsigned char>& rgbaPixels,
                           std::uint32_t& atlasWidth,
                           std::uint32_t& atlasHeight) {
@@ -2814,14 +2397,16 @@ private:
         pushRange.offset = 0;
         pushRange.size = sizeof(MeshPushConstants);
 
-        VkPipelineLayoutCreateInfo layoutInfo{};
-        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts = &textureDescriptorSetLayout_;
-        layoutInfo.pushConstantRangeCount = 1;
-        layoutInfo.pPushConstantRanges = &pushRange;
-        if (dispatch_.vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &meshPipelineLayout_) != VK_SUCCESS) {
-            return false;
+        if (meshPipelineLayout_ == VK_NULL_HANDLE) {
+            VkPipelineLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            layoutInfo.setLayoutCount = 1;
+            layoutInfo.pSetLayouts = &textureDescriptorSetLayout_;
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &pushRange;
+            if (dispatch_.vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &meshPipelineLayout_) != VK_SUCCESS) {
+                return false;
+            }
         }
 
         VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -2846,7 +2431,132 @@ private:
         return ok;
     }
 
+    bool createMeshInstancedPipeline() {
+        if (!createTexturePipelineResources() || meshPipelineLayout_ == VK_NULL_HANDLE) {
+            return false;
+        }
+
+        const auto shaderRoot = rendererAssetRootPath() / "generated" / "shaders";
+        VkShaderModule vertexShader = VK_NULL_HANDLE;
+        VkShaderModule fragmentShader = VK_NULL_HANDLE;
+        if (!createShaderModuleFromFile(shaderRoot / "mesh_instanced.vert.spv", vertexShader) ||
+            !createShaderModuleFromFile(shaderRoot / "mesh.frag.spv", fragmentShader)) {
+            if (vertexShader != VK_NULL_HANDLE) {
+                dispatch_.vkDestroyShaderModule(device_, vertexShader, nullptr);
+            }
+            if (fragmentShader != VK_NULL_HANDLE) {
+                dispatch_.vkDestroyShaderModule(device_, fragmentShader, nullptr);
+            }
+            return false;
+        }
+
+        VkPipelineShaderStageCreateInfo vertexStage{};
+        vertexStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        vertexStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        vertexStage.module = vertexShader;
+        vertexStage.pName = "main";
+
+        VkPipelineShaderStageCreateInfo fragmentStage{};
+        fragmentStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        fragmentStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fragmentStage.module = fragmentShader;
+        fragmentStage.pName = "main";
+        const std::array stages{vertexStage, fragmentStage};
+
+        const std::array<VkVertexInputBindingDescription, 2> bindings{{
+            {0, sizeof(vulkan::MeshVertex), VK_VERTEX_INPUT_RATE_VERTEX},
+            {1, sizeof(MeshInstanceVertex), VK_VERTEX_INPUT_RATE_INSTANCE},
+        }};
+        const std::array<VkVertexInputAttributeDescription, 8> attributes{{
+            {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(vulkan::MeshVertex, px)},
+            {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(vulkan::MeshVertex, nx)},
+            {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(vulkan::MeshVertex, r)},
+            {3, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(vulkan::MeshVertex, u)},
+            {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstanceVertex, modelRow0)},
+            {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstanceVertex, modelRow1)},
+            {6, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstanceVertex, modelRow2)},
+            {7, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(MeshInstanceVertex, modelRow3)},
+        }};
+
+        VkPipelineVertexInputStateCreateInfo vertexInput{};
+        vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInput.vertexBindingDescriptionCount = static_cast<std::uint32_t>(bindings.size());
+        vertexInput.pVertexBindingDescriptions = bindings.data();
+        vertexInput.vertexAttributeDescriptionCount = static_cast<std::uint32_t>(attributes.size());
+        vertexInput.pVertexAttributeDescriptions = attributes.data();
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisample{};
+        multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencil{};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+        colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+        VkPipelineColorBlendStateCreateInfo colorBlend{};
+        colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlend.attachmentCount = 1;
+        colorBlend.pAttachments = &colorBlendAttachment;
+
+        constexpr std::array dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
+        pipelineInfo.pStages = stages.data();
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisample;
+        pipelineInfo.pDepthStencilState = &depthStencil;
+        pipelineInfo.pColorBlendState = &colorBlend;
+        pipelineInfo.pDynamicState = &dynamicState;
+        pipelineInfo.layout = meshPipelineLayout_;
+        pipelineInfo.renderPass = renderPass_;
+        pipelineInfo.subpass = 0;
+
+        const bool ok =
+            dispatch_.vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &meshInstancedPipeline_) == VK_SUCCESS;
+        dispatch_.vkDestroyShaderModule(device_, vertexShader, nullptr);
+        dispatch_.vkDestroyShaderModule(device_, fragmentShader, nullptr);
+        return ok;
+    }
+
     void destroyBuffer(GpuBuffer& buffer) {
+        if (buffer.buffer != VK_NULL_HANDLE && buffer.allocation != VK_NULL_HANDLE && allocator_ != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(allocator_, buffer.buffer, buffer.allocation);
+        }
+        buffer = {};
+    }
+
+    void destroyBuffer(GpuInstanceBuffer& buffer) {
         if (buffer.buffer != VK_NULL_HANDLE && buffer.allocation != VK_NULL_HANDLE && allocator_ != VK_NULL_HANDLE) {
             vmaDestroyBuffer(allocator_, buffer.buffer, buffer.allocation);
         }
@@ -2876,6 +2586,32 @@ private:
         target.vertexCount = static_cast<std::uint32_t>(source.vertices.size());
         target.center = source.center;
         target.radius = source.radius;
+        return true;
+    }
+
+    bool uploadInstanceBuffer(const std::vector<MeshInstanceVertex>& source, GpuInstanceBuffer& target) {
+        destroyBuffer(target);
+        if (source.empty()) {
+            return false;
+        }
+
+        const VkDeviceSize size = sizeof(MeshInstanceVertex) * source.size();
+        if (!createBuffer(size,
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                target.buffer,
+                target.allocation)) {
+            return false;
+        }
+
+        void* mapped = nullptr;
+        if (vmaMapMemory(allocator_, target.allocation, &mapped) != VK_SUCCESS) {
+            destroyBuffer(target);
+            return false;
+        }
+        std::memcpy(mapped, source.data(), static_cast<std::size_t>(size));
+        vmaUnmapMemory(allocator_, target.allocation);
+        target.instanceCount = static_cast<std::uint32_t>(source.size());
         return true;
     }
 
@@ -3193,7 +2929,147 @@ private:
         return true;
     }
 
+    void destroyStaticPropBatches() {
+        for (auto& batch : staticPropBatches_) {
+            destroyBuffer(batch.buffer);
+        }
+        for (auto& batch : staticPropInstanceBatches_) {
+            destroyBuffer(batch.instances);
+        }
+        staticPropBatches_.clear();
+        staticPropInstanceBatches_.clear();
+        staticPropBatchCacheKey_.clear();
+    }
+
+    bool ensureStaticPropBatches(const gameplay::MapData& map) {
+        const std::string key = buildStaticPropBatchCacheKey(map);
+        if (staticPropBatchCacheKey_ == key) {
+            return true;
+        }
+
+        destroyStaticPropBatches();
+        if (map.props.empty()) {
+            staticPropBatchCacheKey_ = key;
+            return true;
+        }
+
+        struct BatchBuildState {
+            std::filesystem::path materialPath;
+            vulkan::CpuMesh mesh;
+            std::size_t propCount = 0;
+        };
+
+        struct InstanceBuildState {
+            std::filesystem::path modelPath;
+            std::filesystem::path materialPath;
+            std::vector<MeshInstanceVertex> instances;
+            std::size_t propCount = 0;
+        };
+
+        std::map<std::string, BatchBuildState> buildStates;
+        std::map<std::string, InstanceBuildState> instanceStates;
+        std::map<std::string, std::size_t> instanceCountsByGroup;
+        for (const auto& prop : map.props) {
+            ++instanceCountsByGroup[buildStaticPropInstanceGroupKey(prop)];
+        }
+        std::size_t sourcePropCount = 0;
+        for (const auto& prop : map.props) {
+            if (prop.modelPath.empty()) {
+                continue;
+            }
+
+            const vulkan::CpuMesh* sourceMesh = cachedSourceCpuMesh(prop.modelPath);
+            if (sourceMesh == nullptr || !sourceMesh->valid || sourceMesh->vertices.empty()) {
+                destroyStaticPropBatches();
+                return false;
+            }
+
+            const std::size_t instanceCount = instanceCountsByGroup[buildStaticPropInstanceGroupKey(prop)];
+            if (shouldInstanceStaticPropGroup(prop, instanceCount)) {
+                InstanceBuildState& buildState = instanceStates[buildStaticPropInstanceGroupKey(prop)];
+                if (buildState.modelPath.empty()) {
+                    buildState.modelPath = prop.modelPath;
+                }
+                if (buildState.materialPath.empty()) {
+                    buildState.materialPath = prop.materialPath;
+                }
+                buildState.instances.push_back(makeMeshInstanceVertex(buildPropModelMatrix(prop)));
+                ++buildState.propCount;
+            } else {
+                BatchBuildState& buildState = buildStates[buildStaticPropBatchGroupKey(prop)];
+                if (buildState.materialPath.empty()) {
+                    buildState.materialPath = prop.materialPath;
+                }
+                appendTransformedCpuMesh(buildState.mesh, *sourceMesh, buildPropModelMatrix(prop));
+                ++buildState.propCount;
+            }
+            ++sourcePropCount;
+        }
+
+        for (auto& [groupKey, buildState] : buildStates) {
+            finalizeMergedCpuMeshBounds(buildState.mesh);
+            if (!buildState.mesh.valid || buildState.mesh.vertices.empty()) {
+                continue;
+            }
+
+            StaticPropBatch batch{
+                .key = groupKey,
+                .materialPath = buildState.materialPath,
+                .buffer = {},
+                .propCount = buildState.propCount,
+            };
+            if (!uploadMesh(buildState.mesh, batch.buffer)) {
+                destroyStaticPropBatches();
+                return false;
+            }
+            staticPropBatches_.push_back(std::move(batch));
+        }
+
+        for (auto& [groupKey, buildState] : instanceStates) {
+            StaticPropInstanceBatch batch{
+                .key = groupKey,
+                .modelPath = buildState.modelPath,
+                .materialPath = buildState.materialPath,
+                .instances = {},
+                .propCount = buildState.propCount,
+            };
+            if (!uploadInstanceBuffer(buildState.instances, batch.instances)) {
+                destroyStaticPropBatches();
+                return false;
+            }
+            staticPropInstanceBatches_.push_back(std::move(batch));
+        }
+
+        staticPropBatchCacheKey_ = key;
+        if (!staticPropBatches_.empty() || !staticPropInstanceBatches_.empty()) {
+            spdlog::info("[Renderer] Built {} merged static prop batches and {} instanced batches from {} props.",
+                staticPropBatches_.size(),
+                staticPropInstanceBatches_.size(),
+                sourcePropCount);
+        }
+        return true;
+    }
+
+    void drawStaticPropBatches(const VkCommandBuffer commandBuffer,
+                               const glm::mat4& projectionView,
+                               const VkViewport& viewport,
+                               const VkRect2D& scissor) {
+        for (const auto& batch : staticPropBatches_) {
+            const auto* texture = cachedTexture({}, batch.materialPath);
+            drawMesh(commandBuffer, batch.buffer, texture, projectionView, glm::mat4(1.0f), viewport, scissor);
+        }
+        for (const auto& batch : staticPropInstanceBatches_) {
+            const auto* mesh = cachedSourceMesh(batch.modelPath);
+            if (mesh == nullptr) {
+                continue;
+            }
+            const auto* texture = cachedTexture({}, batch.materialPath);
+            drawInstancedMesh(commandBuffer, *mesh, batch.instances, texture, projectionView, viewport, scissor);
+        }
+    }
+
     void destroyMeshResources() {
+        destroyStaticPropBatches();
         destroyBuffer(staticWorldMesh_);
         staticWorldMeshKey_.clear();
         for (auto& cached : gpuMeshCache_) {
@@ -3209,6 +3085,43 @@ private:
             destroyTexture(cached.texture);
         }
         textureCache_.clear();
+    }
+
+    void clearImGuiPreviewTextures() {
+        for (auto& cached : imguiPreviewTextures_) {
+            if (cached.descriptorSet != VK_NULL_HANDLE) {
+                ImGui_ImplVulkan_RemoveTexture(cached.descriptorSet);
+            }
+        }
+        imguiPreviewTextures_.clear();
+    }
+
+    ImTextureID cachedImGuiPreviewTexture(const std::filesystem::path& texturePath) {
+        if (!imguiInitialized_ || !imguiVulkanBackendInitialized_ || texturePath.empty()) {
+            return static_cast<ImTextureID>(0);
+        }
+
+        const std::filesystem::path resolvedPath = resolveAssetPath(texturePath);
+        const std::string key = resolvedPath.generic_string();
+        for (const auto& cached : imguiPreviewTextures_) {
+            if (cached.path == key) {
+                return reinterpret_cast<ImTextureID>(cached.descriptorSet);
+            }
+        }
+
+        const TextureResource* texture = cachedTexture(resolvedPath, {});
+        if (texture == nullptr || !texture->valid || texture->view == VK_NULL_HANDLE) {
+            return static_cast<ImTextureID>(0);
+        }
+
+        CachedImGuiPreviewTexture cached{};
+        cached.path = key;
+        cached.descriptorSet = ImGui_ImplVulkan_AddTexture(textureSampler_, texture->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (cached.descriptorSet == VK_NULL_HANDLE) {
+            return static_cast<ImTextureID>(0);
+        }
+        imguiPreviewTextures_.push_back(cached);
+        return reinterpret_cast<ImTextureID>(imguiPreviewTextures_.back().descriptorSet);
     }
 
     void drawMesh(const VkCommandBuffer commandBuffer,
@@ -3235,6 +3148,35 @@ private:
         const MeshPushConstants push = makePushConstants(projectionView, model);
         dispatch_.vkCmdPushConstants(commandBuffer, meshPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
         dispatch_.vkCmdDraw(commandBuffer, mesh.vertexCount, 1, 0, 0);
+    }
+
+    void drawInstancedMesh(const VkCommandBuffer commandBuffer,
+                           const GpuBuffer& mesh,
+                           const GpuInstanceBuffer& instances,
+                           const TextureResource* texture,
+                           const glm::mat4& projectionView,
+                           const VkViewport& viewport,
+                           const VkRect2D& scissor) {
+        if (mesh.buffer == VK_NULL_HANDLE || mesh.vertexCount == 0 ||
+            instances.buffer == VK_NULL_HANDLE || instances.instanceCount == 0 ||
+            meshInstancedPipeline_ == VK_NULL_HANDLE) {
+            return;
+        }
+
+        dispatch_.vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, meshInstancedPipeline_);
+        dispatch_.vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+        dispatch_.vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+        if (texture != nullptr && texture->descriptorSet != VK_NULL_HANDLE) {
+            dispatch_.vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                meshPipelineLayout_, 0, 1, &texture->descriptorSet, 0, nullptr);
+        }
+
+        const std::array<VkBuffer, 2> buffers{mesh.buffer, instances.buffer};
+        const std::array<VkDeviceSize, 2> offsets{0, 0};
+        dispatch_.vkCmdBindVertexBuffers(commandBuffer, 0, static_cast<std::uint32_t>(buffers.size()), buffers.data(), offsets.data());
+        const MeshInstancePushConstants push = makeInstancePushConstants(projectionView);
+        dispatch_.vkCmdPushConstants(commandBuffer, meshPipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+        dispatch_.vkCmdDraw(commandBuffer, mesh.vertexCount, instances.instanceCount, 0, 0);
     }
 
     bool createInstance() {
@@ -3373,7 +3315,15 @@ private:
         }
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         dispatch_.vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice_, surface_, &formatCount, formats.data());
-        surfaceFormat_ = chooseSurfaceFormat(formats);
+        const VkSurfaceFormatKHR chosenSurfaceFormat = chooseSurfaceFormat(formats);
+        const bool rebuildRenderPass =
+            renderPass_ == VK_NULL_HANDLE ||
+            surfaceFormat_.format != chosenSurfaceFormat.format ||
+            surfaceFormat_.colorSpace != chosenSurfaceFormat.colorSpace;
+        if (rebuildRenderPass) {
+            destroySwapchainRenderState();
+        }
+        surfaceFormat_ = chosenSurfaceFormat;
 
         std::uint32_t presentModeCount = 0;
         dispatch_.vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice_, surface_, &presentModeCount, nullptr);
@@ -3425,61 +3375,63 @@ private:
             frames_[index].image = images[index];
         }
 
-        VkAttachmentDescription colorAttachment{};
-        colorAttachment.format = surfaceFormat_.format;
-        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        if (rebuildRenderPass) {
+            VkAttachmentDescription colorAttachment{};
+            colorAttachment.format = surfaceFormat_.format;
+            colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-        VkAttachmentReference colorReference{};
-        colorReference.attachment = 0;
-        colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            VkAttachmentReference colorReference{};
+            colorReference.attachment = 0;
+            colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-        depthFormat_ = chooseDepthFormat();
-        VkAttachmentDescription depthAttachment{};
-        depthAttachment.format = depthFormat_;
-        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depthFormat_ = chooseDepthFormat();
+            VkAttachmentDescription depthAttachment{};
+            depthAttachment.format = depthFormat_;
+            depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-        VkAttachmentReference depthReference{};
-        depthReference.attachment = 1;
-        depthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            VkAttachmentReference depthReference{};
+            depthReference.attachment = 1;
+            depthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-        VkSubpassDescription subpass{};
-        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = 1;
-        subpass.pColorAttachments = &colorReference;
-        subpass.pDepthStencilAttachment = &depthReference;
+            VkSubpassDescription subpass{};
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.colorAttachmentCount = 1;
+            subpass.pColorAttachments = &colorReference;
+            subpass.pDepthStencilAttachment = &depthReference;
 
-        VkSubpassDependency dependency{};
-        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-        dependency.dstSubpass = 0;
-        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            VkSubpassDependency dependency{};
+            dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+            dependency.dstSubpass = 0;
+            dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
-        VkRenderPassCreateInfo renderPassInfo{};
-        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        const std::array attachments{colorAttachment, depthAttachment};
-        renderPassInfo.attachmentCount = static_cast<std::uint32_t>(attachments.size());
-        renderPassInfo.pAttachments = attachments.data();
-        renderPassInfo.subpassCount = 1;
-        renderPassInfo.pSubpasses = &subpass;
-        renderPassInfo.dependencyCount = 1;
-        renderPassInfo.pDependencies = &dependency;
+            VkRenderPassCreateInfo renderPassInfo{};
+            renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+            const std::array attachments{colorAttachment, depthAttachment};
+            renderPassInfo.attachmentCount = static_cast<std::uint32_t>(attachments.size());
+            renderPassInfo.pAttachments = attachments.data();
+            renderPassInfo.subpassCount = 1;
+            renderPassInfo.pSubpasses = &subpass;
+            renderPassInfo.dependencyCount = 1;
+            renderPassInfo.pDependencies = &dependency;
 
-        if (dispatch_.vkCreateRenderPass(device_, &renderPassInfo, nullptr, &renderPass_) != VK_SUCCESS) {
-            spdlog::error("Failed to create Vulkan render pass.");
-            return false;
+            if (dispatch_.vkCreateRenderPass(device_, &renderPassInfo, nullptr, &renderPass_) != VK_SUCCESS) {
+                spdlog::error("Failed to create Vulkan render pass.");
+                return false;
+            }
         }
 
         if (!createDepthResources()) {
@@ -3502,13 +3454,15 @@ private:
             }
         }
 
-        VkCommandPoolCreateInfo commandPoolInfo{};
-        commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        commandPoolInfo.queueFamilyIndex = queueFamilyIndex_;
-        if (dispatch_.vkCreateCommandPool(device_, &commandPoolInfo, nullptr, &commandPool_) != VK_SUCCESS) {
-            spdlog::error("Failed to create command pool.");
-            return false;
+        if (commandPool_ == VK_NULL_HANDLE) {
+            VkCommandPoolCreateInfo commandPoolInfo{};
+            commandPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            commandPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            commandPoolInfo.queueFamilyIndex = queueFamilyIndex_;
+            if (dispatch_.vkCreateCommandPool(device_, &commandPoolInfo, nullptr, &commandPool_) != VK_SUCCESS) {
+                spdlog::error("Failed to create command pool.");
+                return false;
+            }
         }
 
         std::vector<VkCommandBuffer> commandBuffers(frames_.size());
@@ -3540,11 +3494,15 @@ private:
             }
         }
 
-        if (!createMeshPipeline()) {
+        if (meshPipeline_ == VK_NULL_HANDLE && !createMeshPipeline()) {
             spdlog::error("Failed to create mesh graphics pipeline.");
             return false;
         }
-        if (!createTextPipeline()) {
+        if (meshInstancedPipeline_ == VK_NULL_HANDLE && !createMeshInstancedPipeline()) {
+            spdlog::error("Failed to create instanced mesh graphics pipeline.");
+            return false;
+        }
+        if (textPipeline_ == VK_NULL_HANDLE && !createTextPipeline()) {
             spdlog::error("Failed to create text graphics pipeline.");
             return false;
         }
@@ -3552,15 +3510,18 @@ private:
         return true;
     }
 
-    void destroySwapchainResources() {
+    void destroySwapchainFrameResources() {
         if (device_ == VK_NULL_HANDLE) {
             return;
         }
-        destroyStreamingBuffer(textVertexBuffer_);
-        destroyTexture(uiFontAtlasTexture_);
-        uiFontGlyphPlacements_.clear();
-        textVertices_.clear();
+
+        std::vector<VkCommandBuffer> commandBuffers;
+        commandBuffers.reserve(frames_.size());
         for (auto& frame : frames_) {
+            if (frame.commandBuffer != VK_NULL_HANDLE) {
+                commandBuffers.push_back(frame.commandBuffer);
+                frame.commandBuffer = VK_NULL_HANDLE;
+            }
             if (frame.framebuffer != VK_NULL_HANDLE && dispatch_.vkDestroyFramebuffer != nullptr) {
                 dispatch_.vkDestroyFramebuffer(device_, frame.framebuffer, nullptr);
                 frame.framebuffer = VK_NULL_HANDLE;
@@ -3569,16 +3530,45 @@ private:
                 dispatch_.vkDestroyImageView(device_, frame.imageView, nullptr);
                 frame.imageView = VK_NULL_HANDLE;
             }
+            frame.image = VK_NULL_HANDLE;
+        }
+
+        if (!commandBuffers.empty() && commandPool_ != VK_NULL_HANDLE && dispatch_.vkFreeCommandBuffers != nullptr) {
+            dispatch_.vkFreeCommandBuffers(
+                device_,
+                commandPool_,
+                static_cast<std::uint32_t>(commandBuffers.size()),
+                commandBuffers.data());
         }
         frames_.clear();
 
-        if (commandPool_ != VK_NULL_HANDLE && dispatch_.vkDestroyCommandPool != nullptr) {
-            dispatch_.vkDestroyCommandPool(device_, commandPool_, nullptr);
-            commandPool_ = VK_NULL_HANDLE;
+        if (depthImageView_ != VK_NULL_HANDLE && dispatch_.vkDestroyImageView != nullptr) {
+            dispatch_.vkDestroyImageView(device_, depthImageView_, nullptr);
+            depthImageView_ = VK_NULL_HANDLE;
         }
+        if (depthImage_ != VK_NULL_HANDLE && depthAllocation_ != VK_NULL_HANDLE && allocator_ != VK_NULL_HANDLE) {
+            vmaDestroyImage(allocator_, depthImage_, depthAllocation_);
+            depthImage_ = VK_NULL_HANDLE;
+            depthAllocation_ = VK_NULL_HANDLE;
+        }
+        if (swapchain_ != VK_NULL_HANDLE && dispatch_.vkDestroySwapchainKHR != nullptr) {
+            dispatch_.vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+            swapchain_ = VK_NULL_HANDLE;
+        }
+    }
+
+    void destroySwapchainRenderState() {
+        if (device_ == VK_NULL_HANDLE) {
+            return;
+        }
+
         if (meshPipeline_ != VK_NULL_HANDLE && dispatch_.vkDestroyPipeline != nullptr) {
             dispatch_.vkDestroyPipeline(device_, meshPipeline_, nullptr);
             meshPipeline_ = VK_NULL_HANDLE;
+        }
+        if (meshInstancedPipeline_ != VK_NULL_HANDLE && dispatch_.vkDestroyPipeline != nullptr) {
+            dispatch_.vkDestroyPipeline(device_, meshInstancedPipeline_, nullptr);
+            meshInstancedPipeline_ = VK_NULL_HANDLE;
         }
         if (meshPipelineLayout_ != VK_NULL_HANDLE && dispatch_.vkDestroyPipelineLayout != nullptr) {
             dispatch_.vkDestroyPipelineLayout(device_, meshPipelineLayout_, nullptr);
@@ -3592,40 +3582,120 @@ private:
             dispatch_.vkDestroyPipelineLayout(device_, textPipelineLayout_, nullptr);
             textPipelineLayout_ = VK_NULL_HANDLE;
         }
-        if (textureSampler_ != VK_NULL_HANDLE && dispatch_.vkDestroySampler != nullptr) {
-            dispatch_.vkDestroySampler(device_, textureSampler_, nullptr);
-            textureSampler_ = VK_NULL_HANDLE;
-        }
-        if (textureDescriptorPool_ != VK_NULL_HANDLE && dispatch_.vkDestroyDescriptorPool != nullptr) {
-            dispatch_.vkDestroyDescriptorPool(device_, textureDescriptorPool_, nullptr);
-            textureDescriptorPool_ = VK_NULL_HANDLE;
-        }
-        if (textureDescriptorSetLayout_ != VK_NULL_HANDLE && dispatch_.vkDestroyDescriptorSetLayout != nullptr) {
-            dispatch_.vkDestroyDescriptorSetLayout(device_, textureDescriptorSetLayout_, nullptr);
-            textureDescriptorSetLayout_ = VK_NULL_HANDLE;
-        }
-        if (depthImageView_ != VK_NULL_HANDLE && dispatch_.vkDestroyImageView != nullptr) {
-            dispatch_.vkDestroyImageView(device_, depthImageView_, nullptr);
-            depthImageView_ = VK_NULL_HANDLE;
-        }
-        if (depthImage_ != VK_NULL_HANDLE && depthAllocation_ != VK_NULL_HANDLE && allocator_ != VK_NULL_HANDLE) {
-            vmaDestroyImage(allocator_, depthImage_, depthAllocation_);
-            depthImage_ = VK_NULL_HANDLE;
-            depthAllocation_ = VK_NULL_HANDLE;
-        }
         if (renderPass_ != VK_NULL_HANDLE && dispatch_.vkDestroyRenderPass != nullptr) {
             dispatch_.vkDestroyRenderPass(device_, renderPass_, nullptr);
             renderPass_ = VK_NULL_HANDLE;
         }
-        if (swapchain_ != VK_NULL_HANDLE && dispatch_.vkDestroySwapchainKHR != nullptr) {
-            dispatch_.vkDestroySwapchainKHR(device_, swapchain_, nullptr);
-            swapchain_ = VK_NULL_HANDLE;
+    }
+
+    void destroySwapchainResources() {
+        if (device_ == VK_NULL_HANDLE) {
+            return;
         }
+        destroySwapchainFrameResources();
+        destroySwapchainRenderState();
+        if (commandPool_ != VK_NULL_HANDLE && dispatch_.vkDestroyCommandPool != nullptr) {
+            dispatch_.vkDestroyCommandPool(device_, commandPool_, nullptr);
+            commandPool_ = VK_NULL_HANDLE;
+        }
+    }
+
+    VkExtent2D currentDrawableExtent() const {
+        VkExtent2D extent{};
+        if (hostWindow_ != nullptr) {
+            extent.width = static_cast<std::uint32_t>(std::max(0, hostWindow_->clientWidth()));
+            extent.height = static_cast<std::uint32_t>(std::max(0, hostWindow_->clientHeight()));
+            return extent;
+        }
+
+        if (hwnd_ == nullptr) {
+            return extent;
+        }
+
+        RECT rect{};
+        GetClientRect(hwnd_, &rect);
+        extent.width = static_cast<std::uint32_t>(std::max<LONG>(0, rect.right - rect.left));
+        extent.height = static_cast<std::uint32_t>(std::max<LONG>(0, rect.bottom - rect.top));
+        return extent;
+    }
+
+    bool hasDrawableExtent() const {
+        const VkExtent2D extent = currentDrawableExtent();
+        return extent.width > 0 && extent.height > 0;
+    }
+
+    bool swapchainExtentMatchesWindow() const {
+        const VkExtent2D extent = currentDrawableExtent();
+        if (extent.width == 0 || extent.height == 0) {
+            return true;
+        }
+        return extent.width == swapchainExtent_.width && extent.height == swapchainExtent_.height;
+    }
+
+    bool shouldThrottleSwapchainRecreation() const {
+        constexpr Uint64 kResizeRecreateIntervalMs = 16;
+        if (!swapchainDirty_ || lastSwapchainResizeEventTick_ == 0) {
+            return false;
+        }
+
+        const Uint64 now = SDL_GetTicks();
+        return (now - lastSwapchainResizeEventTick_) < kResizeRecreateIntervalMs &&
+            (now - lastSwapchainRecreateTick_) < kResizeRecreateIntervalMs;
+    }
+
+    bool recreateSwapchain() {
+        if (device_ == VK_NULL_HANDLE || surface_ == VK_NULL_HANDLE) {
+            return false;
+        }
+
+        const VkExtent2D extent = currentDrawableExtent();
+        if (extent.width == 0 || extent.height == 0) {
+            swapchainDirty_ = true;
+            return false;
+        }
+
+        spdlog::info("[Renderer] Recreating swapchain: {}x{}", extent.width, extent.height);
+        if (renderFence_ != VK_NULL_HANDLE && dispatch_.vkWaitForFences != nullptr) {
+            dispatch_.vkWaitForFences(device_, 1, &renderFence_, VK_TRUE, UINT64_MAX);
+        }
+        if (graphicsQueue_ != VK_NULL_HANDLE && dispatch_.vkQueueWaitIdle != nullptr) {
+            dispatch_.vkQueueWaitIdle(graphicsQueue_);
+        }
+
+        shutdownImGuiVulkanBackend();
+        destroySwapchainFrameResources();
+
+        if (!createSwapchainResources()) {
+            spdlog::error("[Renderer] Failed to recreate swapchain resources.");
+            swapchainDirty_ = true;
+            return false;
+        }
+
+        if (imguiInitialized_ && !initializeImGuiVulkanBackend()) {
+            spdlog::error("[Renderer] Failed to reinitialize ImGui Vulkan backend after resize.");
+            swapchainDirty_ = true;
+            return false;
+        }
+
+        lastSwapchainRecreateTick_ = SDL_GetTicks();
+        swapchainDirty_ = false;
+        return true;
     }
 
     void drawFrame(const RenderFrame& frame) {
         if (device_ == VK_NULL_HANDLE || swapchain_ == VK_NULL_HANDLE) {
             return;
+        }
+
+        if (!hasDrawableExtent()) {
+            swapchainDirty_ = true;
+            return;
+        }
+
+        if ((swapchainDirty_ || !swapchainExtentMatchesWindow()) && !shouldThrottleSwapchainRecreation()) {
+            if (!recreateSwapchain()) {
+                return;
+            }
         }
 
         if (dispatch_.vkWaitForFences(device_, 1, &renderFence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
@@ -3634,9 +3704,22 @@ private:
 
         std::uint32_t imageIndex = 0;
         const VkResult acquireResult = dispatch_.vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageAvailableSemaphore_, VK_NULL_HANDLE, &imageIndex);
-        if (acquireResult != VK_SUCCESS) {
+        if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+            swapchainDirty_ = true;
+            if (!shouldThrottleSwapchainRecreation()) {
+                recreateSwapchain();
+            }
             return;
         }
+        if (acquireResult == VK_NOT_READY || acquireResult == VK_TIMEOUT) {
+            swapchainDirty_ = swapchainDirty_ || !swapchainExtentMatchesWindow();
+            return;
+        }
+        if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
+            spdlog::warn("[Renderer] vkAcquireNextImageKHR failed with {}", static_cast<int>(acquireResult));
+            return;
+        }
+        const bool swapchainSuboptimal = acquireResult == VK_SUBOPTIMAL_KHR;
 
         dispatch_.vkResetFences(device_, 1, &renderFence_);
         dispatch_.vkResetCommandBuffer(frames_[imageIndex].commandBuffer, 0);
@@ -3663,7 +3746,15 @@ private:
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &swapchain_;
         presentInfo.pImageIndices = &imageIndex;
-        dispatch_.vkQueuePresentKHR(graphicsQueue_, &presentInfo);
+        const VkResult presentResult = dispatch_.vkQueuePresentKHR(graphicsQueue_, &presentInfo);
+        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR || swapchainSuboptimal) {
+            swapchainDirty_ = true;
+            if (!shouldThrottleSwapchainRecreation()) {
+                recreateSwapchain();
+            }
+        } else if (presentResult != VK_SUCCESS) {
+            spdlog::warn("[Renderer] vkQueuePresentKHR failed with {}", static_cast<int>(presentResult));
+        }
     }
 
     const PreviewMeshModel* cachedPreviewMeshModel(const std::filesystem::path& path) {
@@ -3842,15 +3933,20 @@ private:
             const auto* defaultTexture = ensureDefaultTexture() ? &defaultTexture_ : nullptr;
             drawMesh(commandBuffer, staticWorldMesh_, defaultTexture, projectionView, glm::mat4(1.0f), worldViewport, worldScissor);
         }
-        for (const auto& prop : map.props) {
-            const auto* mesh = cachedSourceMesh(prop.modelPath);
-            if (mesh == nullptr) {
-                continue;
+
+        if (ensureStaticPropBatches(map)) {
+            drawStaticPropBatches(commandBuffer, projectionView, worldViewport, worldScissor);
+        } else {
+            for (const auto& prop : map.props) {
+                const auto* mesh = cachedSourceMesh(prop.modelPath);
+                if (mesh == nullptr) {
+                    continue;
+                }
+                const auto* texture = cachedTexture({}, prop.materialPath);
+                drawMesh(commandBuffer, *mesh, texture, projectionView,
+                    buildPropModelMatrix(prop),
+                    worldViewport, worldScissor);
             }
-            const auto* texture = cachedTexture({}, prop.materialPath);
-            drawMesh(commandBuffer, *mesh, texture, projectionView,
-                buildPropModelMatrix(prop),
-                worldViewport, worldScissor);
         }
         const auto* playerMesh = cachedSourceMesh(renderFrame.playerCharacterModelPath);
         const auto* playerTexture = cachedTexture(renderFrame.playerCharacterAlbedoPath, renderFrame.playerCharacterMaterialPath);
@@ -4132,7 +4228,7 @@ private:
         textVertices_.clear();
         recordLayout(frame.commandBuffer, renderFrame);
         flushTextBatch(frame.commandBuffer);
-        if (imguiInitialized_) {
+        if (imguiInitialized_ && imguiVulkanBackendInitialized_) {
             ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), frame.commandBuffer);
         }
         dispatch_.vkCmdEndRenderPass(frame.commandBuffer);
@@ -4325,13 +4421,17 @@ private:
             drawMesh(commandBuffer, staticWorldMesh_, defaultTexture, projectionView, glm::mat4(1.0f), viewport, scissor);
         }
 
-        for (const auto& prop : map.props) {
-            const auto* mesh = cachedSourceMesh(prop.modelPath);
-            if (mesh == nullptr) {
-                continue;
+        if (ensureStaticPropBatches(map)) {
+            drawStaticPropBatches(commandBuffer, projectionView, viewport, scissor);
+        } else {
+            for (const auto& prop : map.props) {
+                const auto* mesh = cachedSourceMesh(prop.modelPath);
+                if (mesh == nullptr) {
+                    continue;
+                }
+                const auto* texture = cachedTexture({}, prop.materialPath);
+                drawMesh(commandBuffer, *mesh, texture, projectionView, buildPropModelMatrix(prop), viewport, scissor);
             }
-            const auto* texture = cachedTexture({}, prop.materialPath);
-            drawMesh(commandBuffer, *mesh, texture, projectionView, buildPropModelMatrix(prop), viewport, scissor);
         }
 
         if (renderFrame.editorPlacementPreviewKind == RenderFrame::EditorPlacementPreviewKind::Prop) {
@@ -4402,47 +4502,53 @@ private:
 
         const auto meshOutlineColor = makeAttachment(0.28f, 0.96f, 0.48f);
         const auto collisionOutlineColor = makeAttachment(0.30f, 0.58f, 0.98f);
+        const auto boundingBoxColor = makeAttachment(0.98f, 0.82f, 0.32f);
 
         const auto drawOutlinedProp = [&](const int propIndex,
                                           const float meshThicknessPx,
-                                          const float collisionThicknessPx,
-                                          const std::string& label) {
+                                          const float collisionThicknessPx) {
             if (propIndex < 0 || propIndex >= static_cast<int>(map.props.size())) {
                 return;
             }
             const gameplay::MapProp& prop = map.props[static_cast<std::size_t>(propIndex)];
-            float labelMinY = 0.0f;
-            float labelMidX = 0.0f;
-
-            bool drewMeshOutline = false;
+            const glm::mat4 propModel = buildPropModelMatrix(prop);
             if (const auto* cpuMesh = cachedSourceCpuMesh(prop.modelPath); cpuMesh != nullptr) {
-                drewMeshOutline = recordPropMeshSilhouette(
+                if (renderFrame.editorShowMeshOutline) {
+                    recordPropMeshSilhouette(
+                        dispatch_,
+                        commandBuffer,
+                        swapchainExtent_,
+                        projectionView,
+                        propModel,
+                        *cpuMesh,
+                        meshOutlineColor,
+                        meshThicknessPx,
+                        nullptr,
+                        nullptr);
+                }
+                if (renderFrame.editorShowBoundingBox) {
+                    recordProjectedBoundingBox(
+                        dispatch_,
+                        commandBuffer,
+                        swapchainExtent_,
+                        projectionView,
+                        buildMeshBoundingBoxCorners(propModel, *cpuMesh),
+                        boundingBoxColor,
+                        1.6f);
+                }
+            }
+
+            if (renderFrame.editorShowCollisionOutline) {
+                recordPropOutline(
                     dispatch_,
                     commandBuffer,
                     swapchainExtent_,
                     projectionView,
-                    buildPropModelMatrix(prop),
-                    *cpuMesh,
-                    meshOutlineColor,
-                    meshThicknessPx,
-                    &labelMinY,
-                    &labelMidX);
-            }
-
-            const bool drewCollisionOutline = recordPropOutline(
-                dispatch_,
-                commandBuffer,
-                swapchainExtent_,
-                projectionView,
-                prop,
-                collisionOutlineColor,
-                collisionThicknessPx,
-                drewMeshOutline ? nullptr : &labelMinY,
-                drewMeshOutline ? nullptr : &labelMidX);
-
-            if (drewMeshOutline || drewCollisionOutline) {
-                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, meshOutlineColor,
-                    labelMidX, std::max(18.0f, labelMinY - 8.0f), widenUtf8(label), 0.28f, 0.02f);
+                    prop,
+                    collisionOutlineColor,
+                    collisionThicknessPx,
+                    nullptr,
+                    nullptr);
             }
         };
 
@@ -4452,49 +4558,53 @@ private:
             drawOutlinedProp(
                 renderFrame.selectedEditorPropIndex,
                 2.4f,
-                1.8f,
-                renderFrame.selectedEditorPropLabel);
+                1.8f);
         }
         if (renderFrame.hoveredEditorPropIndex >= 0) {
             drawOutlinedProp(
                 renderFrame.hoveredEditorPropIndex,
                 renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex ? 3.8f : 3.2f,
-                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex ? 2.8f : 2.2f,
-                renderFrame.hoveredEditorPropIndex == renderFrame.selectedEditorPropIndex
-                    ? renderFrame.selectedEditorPropLabel
-                    : describeEditorPropLabel(map.props[static_cast<std::size_t>(renderFrame.hoveredEditorPropIndex)]));
+                renderFrame.eraseEditorPropIndex == renderFrame.hoveredEditorPropIndex ? 2.8f : 2.2f);
         }
         if (renderFrame.editorPlacementPreviewKind == RenderFrame::EditorPlacementPreviewKind::Prop) {
-            float labelMinY = 0.0f;
-            float labelMidX = 0.0f;
-            bool drewPreviewMesh = false;
+            const glm::mat4 previewModel = buildPropModelMatrix(renderFrame.editorPlacementPreviewProp);
             if (const auto* previewCpuMesh = cachedSourceCpuMesh(renderFrame.editorPlacementPreviewProp.modelPath);
                 previewCpuMesh != nullptr) {
-                drewPreviewMesh = recordPropMeshSilhouette(
+                if (renderFrame.editorShowMeshOutline) {
+                    recordPropMeshSilhouette(
+                        dispatch_,
+                        commandBuffer,
+                        swapchainExtent_,
+                        projectionView,
+                        previewModel,
+                        *previewCpuMesh,
+                        meshOutlineColor,
+                        2.6f,
+                        nullptr,
+                        nullptr);
+                }
+                if (renderFrame.editorShowBoundingBox) {
+                    recordProjectedBoundingBox(
+                        dispatch_,
+                        commandBuffer,
+                        swapchainExtent_,
+                        projectionView,
+                        buildMeshBoundingBoxCorners(previewModel, *previewCpuMesh),
+                        boundingBoxColor,
+                        1.6f);
+                }
+            }
+            if (renderFrame.editorShowCollisionOutline) {
+                recordPropOutline(
                     dispatch_,
                     commandBuffer,
                     swapchainExtent_,
                     projectionView,
-                    buildPropModelMatrix(renderFrame.editorPlacementPreviewProp),
-                    *previewCpuMesh,
-                    meshOutlineColor,
-                    2.6f,
-                    &labelMinY,
-                    &labelMidX);
-            }
-            const bool drewPreviewCollision = recordPropOutline(
-                dispatch_,
-                commandBuffer,
-                swapchainExtent_,
-                projectionView,
-                renderFrame.editorPlacementPreviewProp,
-                collisionOutlineColor,
-                2.0f,
-                drewPreviewMesh ? nullptr : &labelMinY,
-                drewPreviewMesh ? nullptr : &labelMidX);
-            if (drewPreviewMesh || drewPreviewCollision) {
-                recordCenteredBitmapText(dispatch_, commandBuffer, swapchainExtent_, meshOutlineColor,
-                    labelMidX, std::max(18.0f, labelMinY - 8.0f), L"放置预览", 0.26f, 0.02f);
+                    renderFrame.editorPlacementPreviewProp,
+                    collisionOutlineColor,
+                    2.0f,
+                    nullptr,
+                    nullptr);
             }
         }
 
@@ -4521,82 +4631,6 @@ private:
             }
         }
 
-        if (!renderFrame.editorIsOrthoView && renderFrame.editorMouseLookActive) {
-            const float crossX = widthPx * 0.5f;
-            const float crossY = heightPx * 0.5f;
-            const auto crossColor = makeAttachment(0.98f, 0.95f, 0.80f);
-            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 11.0f, crossY - 1.0f, crossX - 3.0f, crossY + 1.0f));
-            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX + 3.0f, crossY - 1.0f, crossX + 11.0f, crossY + 1.0f));
-            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 1.0f, crossY - 11.0f, crossX + 1.0f, crossY - 3.0f));
-            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 1.0f, crossY + 3.0f, crossX + 1.0f, crossY + 11.0f));
-            clearRect(dispatch_, commandBuffer, crossColor, makePixelRect(swapchainExtent_, crossX - 1.5f, crossY - 1.5f, crossX + 1.5f, crossY + 1.5f));
-        }
-
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.05f, 0.07f, 0.09f), makeRect(swapchainExtent_, 0.72f, 0.03f, 0.98f, 0.18f));
-        clearRect(dispatch_, commandBuffer, makeAttachment(0.05f, 0.07f, 0.09f), makeRect(swapchainExtent_, 0.18f, 0.90f, 0.98f, 0.98f));
-
-        const auto titleColor = makeAttachment(0.97f, 0.96f, 0.92f);
-        const auto bodyColor = makeAttachment(0.88f, 0.91f, 0.94f);
-        const auto accentColor = makeAttachment(0.99f, 0.87f, 0.46f);
-        const auto mutedColor = makeAttachment(0.74f, 0.80f, 0.84f);
-
-        std::ostringstream overlay;
-        overlay << "3D 地图编辑器\n";
-        overlay << map.name << "\n";
-        overlay << "工具 " << renderFrame.editorToolLabel << "\n";
-        overlay << "模式 " << renderFrame.editorPlacementKindLabel << "\n";
-        overlay << "视图 " << renderFrame.editorViewModeLabel << "\n";
-        overlay << "目标点 "
-                << static_cast<int>(renderFrame.editorTargetPosition.x * 10.0f) / 10.0f << ", "
-                << static_cast<int>(renderFrame.editorTargetPosition.y * 10.0f) / 10.0f << ", "
-                << static_cast<int>(renderFrame.editorTargetPosition.z * 10.0f) / 10.0f << "\n";
-        overlay << (renderFrame.editorTargetOnSurface ? "表面吸附" : "自由摆放") << "\n";
-        overlay << "相机 " << static_cast<int>(renderFrame.cameraPosition.x * 10.0f) / 10.0f
-                << ", " << static_cast<int>(renderFrame.cameraPosition.y * 10.0f) / 10.0f
-                << ", " << static_cast<int>(renderFrame.cameraPosition.z * 10.0f) / 10.0f << "\n";
-        overlay << "道具 " << renderFrame.editorPropCount << "  出生点 " << renderFrame.editorSpawnCount
-                << "  撤销 " << (renderFrame.editorUndoAvailable ? "可用" : "空");
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, titleColor,
-            widthPx * 0.74f, heightPx * 0.06f, widenUtf8(overlay.str()), 0.34f, 0.04f, 1.06f);
-
-        std::ostringstream selectionStatus;
-        if (renderFrame.hasSelectedEditorProp) {
-            selectionStatus << "选中 " << renderFrame.selectedEditorPropLabel << "\n";
-            selectionStatus << "位置 " << renderFrame.selectedEditorPropPosition.x << ", "
-                            << renderFrame.selectedEditorPropPosition.y << ", "
-                            << renderFrame.selectedEditorPropPosition.z << "\n";
-            selectionStatus << "旋转 " << renderFrame.selectedEditorPropRotationDegrees.x << ", "
-                            << renderFrame.selectedEditorPropRotationDegrees.y << ", "
-                            << renderFrame.selectedEditorPropRotationDegrees.z << "\n";
-            selectionStatus << "缩放 " << renderFrame.selectedEditorPropScale.x << ", "
-                            << renderFrame.selectedEditorPropScale.y << ", "
-                            << renderFrame.selectedEditorPropScale.z;
-        } else if (renderFrame.hoveredEditorSpawnIndex >= 0) {
-            selectionStatus << "悬停出生点\n";
-            selectionStatus << renderFrame.editorCellSpawnLabel << "\n";
-            selectionStatus << "可切换到擦除工具删除";
-        } else {
-            selectionStatus << "当前未锁定道具\n";
-            selectionStatus << "选择工具会自动锁定鼠标指中的对象";
-        }
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, accentColor,
-            widthPx * 0.74f, heightPx * 0.20f, widenUtf8(selectionStatus.str()), 0.30f, 0.03f, 1.04f);
-
-        const std::wstring lookHint = renderFrame.editorIsOrthoView
-            ? L"2.5D 规划视图"
-            : (renderFrame.editorMouseLookActive
-                ? L"环视中"
-                : L"鼠标指向编辑");
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, mutedColor,
-            widthPx * 0.79f, heightPx * 0.33f, lookHint, 0.28f, 0.03f);
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, bodyColor,
-            widthPx * 0.20f, heightPx * 0.935f,
-            renderFrame.editorIsOrthoView
-                ? L"WASD 平移  滚轮缩放  Space/Ctrl 微调缩放  1 选择  2 放置  3 擦除  G 放置类型  O 切换 2.5D 视图  Ctrl+Z 撤销"
-                : L"右键环视  鼠标悬停选择  1 选择  2 放置  3 擦除  G 放置类型  R 旋转  Tab 缩放  O 视图切换  Ctrl+Z 撤销",
-            0.29f, 0.03f);
-        recordBitmapText(dispatch_, commandBuffer, swapchainExtent_, accentColor,
-            widthPx * 0.20f, heightPx * 0.965f, widenUtf8(renderFrame.editorStatusLabel), 0.28f, 0.03f);
     }
 
     void recordSettings(const VkCommandBuffer commandBuffer, const RenderFrame& renderFrame) {
@@ -4688,6 +4722,7 @@ private:
     VkSampler textureSampler_ = VK_NULL_HANDLE;
     VkPipelineLayout meshPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline meshPipeline_ = VK_NULL_HANDLE;
+    VkPipeline meshInstancedPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout textPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline textPipeline_ = VK_NULL_HANDLE;
     VkSemaphore imageAvailableSemaphore_ = VK_NULL_HANDLE;
@@ -4699,8 +4734,12 @@ private:
     bool editorPrinted_ = false;
     bool bitmapUiLogged_ = false;
     bool imguiInitialized_ = false;
+    bool imguiVulkanBackendInitialized_ = false;
     bool imguiKeyboardCapture_ = false;
     bool imguiMouseCapture_ = false;
+    bool swapchainDirty_ = false;
+    Uint64 lastSwapchainResizeEventTick_ = 0;
+    Uint64 lastSwapchainRecreateTick_ = 0;
     GpuBuffer staticWorldMesh_{};
     TextureResource defaultTexture_{};
     TextureResource uiFontAtlasTexture_{};
@@ -4708,11 +4747,30 @@ private:
     std::string staticWorldMeshKey_;
     std::vector<CachedGpuMesh> gpuMeshCache_{};
     std::vector<CachedTexture> textureCache_{};
+    std::vector<CachedImGuiPreviewTexture> imguiPreviewTextures_{};
     std::vector<CachedPreviewMesh> previewMeshCache_{};
+    std::vector<StaticPropBatch> staticPropBatches_{};
+    std::vector<StaticPropInstanceBatch> staticPropInstanceBatches_{};
     std::vector<UiFontGlyphPlacement> uiFontGlyphPlacements_{};
     std::vector<TextVertex> textVertices_{};
     std::vector<UiAction> pendingUiActions_{};
+    std::string staticPropBatchCacheKey_;
     std::array<char, 128> multiplayerHostDraft_{};
+    std::array<char, 128> editorModelFilter_{};
+    std::array<char, 128> managedObjectFilter_{};
+    std::array<char, 128> managedObjectIdDraft_{};
+    std::array<char, 128> managedObjectLabelDraft_{};
+    std::array<char, 128> managedObjectCategoryDraft_{};
+    std::array<char, 256> managedObjectModelPathDraft_{};
+    std::array<char, 256> managedObjectMaterialPathDraft_{};
+    std::array<char, 256> managedObjectTagsDraft_{};
+    std::string managedObjectDraftFingerprint_;
+    int managedObjectPlacementKindDraft_ = 0;
+    bool managedObjectCylindricalDraft_ = false;
+    bool managedObjectEditorVisibleDraft_ = true;
+    float managedObjectCollisionHalfExtentsDraft_[3]{};
+    float managedObjectCollisionCenterOffsetDraft_[3]{};
+    float managedObjectPreviewColorDraft_[3]{};
     int multiplayerSessionTypeDraft_ = 0;
     int multiplayerPortDraft_ = 37015;
     int multiplayerMaxPlayersDraft_ = 10;

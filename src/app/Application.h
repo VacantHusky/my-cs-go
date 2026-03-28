@@ -33,6 +33,7 @@ enum class TrainingEquipmentSlot {
 
 enum class MapEditorTool {
     Select,
+    Pan,
     Place,
     Erase,
 };
@@ -150,6 +151,7 @@ private:
     void saveActiveMapArtifacts(const char* reason);
     void switchMapEditorViewMode(MapEditorViewMode nextMode);
     void syncMapEditorCameraState();
+    void focusMapEditorOnProp(std::size_t index);
     util::Vec3 clampMapEditorPerspectiveCameraPosition(const util::Vec3& position) const;
     util::Vec3 clampMapEditorOrthoFocusPosition(const util::Vec3& position) const;
     util::Vec3 deriveMapEditorFocusPointFromPerspective() const;

@@ -84,6 +84,7 @@ struct RenderFrame {
     std::string editorViewModeLabel;
     std::string editorStatusLabel;
     std::string editorMapFileLabel;
+    float editorSidebarWidth = 520.0f;
     bool editorMouseLookActive = false;
     bool editorIsOrthoView = false;
     float editorOrthoSpan = 0.0f;
@@ -163,6 +164,7 @@ enum class UiActionType {
     CreateMapBrowserMap,
     SelectMapEditorTool,
     SelectMapEditorPlacementKind,
+    SelectSceneEditorProp,
     SelectEditorObjectAsset,
     SelectManagedObjectAsset,
     CreateManagedObjectAsset,
@@ -194,6 +196,7 @@ enum class UiActionType {
     CycleEditorMap,
     CreateEditorMap,
     SaveEditorMap,
+    SetEditorSidebarWidth,
     AdjustMultiplayerSetting,
     SetMultiplayerSessionType,
     SetMultiplayerHost,

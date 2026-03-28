@@ -73,11 +73,11 @@ const MaterialAssetEntry* findMaterialAssetByPath(const AssetManifest& manifest,
 std::filesystem::path chooseThumbnailPath(const AssetManifest& manifest,
                                           const std::filesystem::path& modelPath,
                                           const std::filesystem::path& materialPath) {
-    if (const auto* material = findMaterialAssetByPath(manifest, materialPath); material != nullptr && !material->thumbnailPath.empty()) {
-        return material->thumbnailPath;
-    }
     if (const auto* model = findModelAssetByPath(manifest, modelPath); model != nullptr && !model->thumbnailPath.empty()) {
         return model->thumbnailPath;
+    }
+    if (const auto* material = findMaterialAssetByPath(manifest, materialPath); material != nullptr && !material->thumbnailPath.empty()) {
+        return material->thumbnailPath;
     }
     return {};
 }
@@ -296,7 +296,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "editor_brush_floor",
         "地面盒体",
-        "结构",
+        "建筑部件",
         ObjectPlacementKind::Wall,
         "generated/models/crate.obj",
         "generated/materials/polyhaven_concrete_floor.mat",
@@ -310,7 +310,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "editor_brush_wall",
         "盒体墙",
-        "结构",
+        "建筑部件",
         ObjectPlacementKind::Wall,
         "generated/models/crate.obj",
         "generated/materials/polyhaven_concrete_wall_006.mat",
@@ -324,7 +324,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "bomb_site_a",
         "A 爆点标记",
-        "标记",
+        "标记与玩法",
         ObjectPlacementKind::Prop,
         "generated/models/crate.obj",
         "generated/materials/bomb_site_a.mat",
@@ -338,7 +338,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "bomb_site_b",
         "B 爆点标记",
-        "标记",
+        "标记与玩法",
         ObjectPlacementKind::Prop,
         "generated/models/crate.obj",
         "generated/materials/bomb_site_b.mat",
@@ -352,7 +352,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "wooden_crate",
         "木箱",
-        "掩体",
+        "人造物体",
         ObjectPlacementKind::Prop,
         "source/polyhaven/models/wooden_crate_02/wooden_crate_02_1k.gltf",
         "generated/materials/polyhaven_wooden_crate_02.mat",
@@ -366,7 +366,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "classic64_crate",
         "Classic64 货运箱",
-        "掩体",
+        "人造物体",
         ObjectPlacementKind::Prop,
         "source/polyhaven/models/wooden_crate_02/wooden_crate_02_1k.gltf",
         "generated/materials/classic64_box_shipping_01.mat",
@@ -380,7 +380,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "barrel_02",
         "金属油桶",
-        "掩体",
+        "人造物体",
         ObjectPlacementKind::Prop,
         "source/polyhaven/models/Barrel_02/Barrel_02_1k.gltf",
         "generated/materials/polyhaven_barrel_02.mat",
@@ -394,7 +394,7 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
         manifest,
         "metro_psx_station",
         "Metro 站台结构",
-        "场景",
+        "大型建筑",
         ObjectPlacementKind::Prop,
         "source/itchio/metro_psx/Models/Metro.glb",
         {},
@@ -408,7 +408,9 @@ ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, 
     return catalog;
 }
 
-ObjectCatalog loadObjectCatalog(const std::filesystem::path& assetRoot, const std::filesystem::path& path) {
+ObjectCatalog loadObjectCatalog(const std::filesystem::path& assetRoot,
+                                const std::filesystem::path& path,
+                                const AssetManifest& manifest) {
     ObjectCatalog catalog;
     catalog.catalogPath = std::filesystem::relative(path, assetRoot);
 
@@ -480,6 +482,20 @@ ObjectCatalog loadObjectCatalog(const std::filesystem::path& assetRoot, const st
         }
         if (tryGetField(object, "tags", objectField)) {
             definition.tags = readTags(objectField);
+        }
+        const std::filesystem::path derivedThumbnail = chooseThumbnailPath(manifest, definition.modelPath, definition.materialPath);
+        if (definition.thumbnailPath.empty()) {
+            definition.thumbnailPath = derivedThumbnail;
+        } else {
+            const auto* material = findMaterialAssetByPath(manifest, definition.materialPath);
+            const bool pointsToMaterialPreview =
+                material != nullptr &&
+                !material->thumbnailPath.empty() &&
+                material->thumbnailPath.lexically_normal().generic_string() ==
+                    definition.thumbnailPath.lexically_normal().generic_string();
+            if (pointsToMaterialPreview && !derivedThumbnail.empty()) {
+                definition.thumbnailPath = derivedThumbnail;
+            }
         }
         catalog.upsert(std::move(definition));
     }

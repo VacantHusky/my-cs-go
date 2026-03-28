@@ -16,6 +16,7 @@ std::string serialize(const Settings& settings) {
     out << "video.fullscreen=" << (settings.video.fullscreen ? 1 : 0) << '\n';
     out << "video.render_scale=" << settings.video.renderScale << '\n';
     out << "video.antialiasing=" << settings.video.antialiasing << '\n';
+    out << "video.editor_sidebar_width=" << settings.video.editorSidebarWidth << '\n';
     out << "audio.master=" << settings.audio.master << '\n';
     out << "audio.music=" << settings.audio.music << '\n';
     out << "audio.effects=" << settings.audio.effects << '\n';
@@ -38,6 +39,7 @@ void applyKeyValue(Settings& settings, const std::string& key, const std::string
     else if (key == "video.fullscreen") settings.video.fullscreen = value == "1";
     else if (key == "video.render_scale") settings.video.renderScale = std::stof(value);
     else if (key == "video.antialiasing") settings.video.antialiasing = value;
+    else if (key == "video.editor_sidebar_width") settings.video.editorSidebarWidth = std::stof(value);
     else if (key == "audio.master") settings.audio.master = std::stof(value);
     else if (key == "audio.music") settings.audio.music = std::stof(value);
     else if (key == "audio.effects") settings.audio.effects = std::stof(value);

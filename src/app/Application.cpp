@@ -1019,6 +1019,7 @@ void Application::tick(const float deltaSeconds) {
         .editorViewModeLabel = mapEditorViewModeLabel(),
         .editorStatusLabel = mapEditorStatus_,
         .editorMapFileLabel = activeMapPath_.stem().string(),
+        .editorSidebarWidth = settings_.video.editorSidebarWidth,
         .editorMouseLookActive = mapEditorMouseLookActive_,
         .editorIsOrthoView = mapEditorViewMode_ == MapEditorViewMode::Ortho25D,
         .editorOrthoSpan = mapEditorOrthoSpan_,
@@ -1620,10 +1621,14 @@ void Application::handleRendererUiActions() {
                 }
                 break;
             case renderer::UiActionType::SelectMapBrowserItem:
-                if ((currentFlow_ == AppFlow::MapBrowser || currentFlow_ == AppFlow::MultiPlayerLobby) && action.value0 >= 0) {
+                if ((currentFlow_ == AppFlow::MapBrowser || currentFlow_ == AppFlow::MultiPlayerLobby || currentFlow_ == AppFlow::MapEditor) &&
+                    action.value0 >= 0) {
                     loadEditorMapByIndex(static_cast<std::size_t>(action.value0));
                     if (currentFlow_ == AppFlow::MultiPlayerLobby) {
                         multiplayerStatus_ = std::string("已选择地图: ") + activeMapPath_.stem().string();
+                        needsRedraw_ = true;
+                    } else if (currentFlow_ == AppFlow::MapEditor) {
+                        mapEditorStatus_ = std::string("已打开地图: ") + activeMapPath_.stem().string();
                         needsRedraw_ = true;
                     }
                 }
@@ -1659,6 +1664,16 @@ void Application::handleRendererUiActions() {
                         syncMapEditorTargetFromView();
                     }
                     needsRedraw_ = true;
+                }
+                break;
+            case renderer::UiActionType::SelectSceneEditorProp:
+                if (currentFlow_ == AppFlow::MapEditor && action.value0 >= 0) {
+                    const std::size_t index = static_cast<std::size_t>(action.value0);
+                    if (index < activeMap_.props.size()) {
+                        focusMapEditorOnProp(index);
+                        mapEditorStatus_ = std::string("已选中对象: ") + propDisplayLabel(activeMap_.props[index]);
+                        needsRedraw_ = true;
+                    }
                 }
                 break;
             case renderer::UiActionType::SelectMapEditorPlacementKind:
@@ -1858,6 +1873,16 @@ void Application::handleRendererUiActions() {
                     saveActiveMapArtifacts("ImGui 编辑器保存");
                     mapEditorStatus_ = "地图与预览图已保存";
                     needsRedraw_ = true;
+                }
+                break;
+            case renderer::UiActionType::SetEditorSidebarWidth:
+                if (currentFlow_ == AppFlow::MapEditor) {
+                    const float nextWidth = std::clamp(static_cast<float>(action.value0), 320.0f, 860.0f);
+                    if (std::abs(settings_.video.editorSidebarWidth - nextWidth) > 0.5f) {
+                        settings_.video.editorSidebarWidth = nextWidth;
+                        saveSettings(settings_, settingsPath_);
+                        needsRedraw_ = true;
+                    }
                 }
                 break;
             case renderer::UiActionType::AdjustMultiplayerSetting:
@@ -2082,6 +2107,26 @@ void Application::syncMapEditorCameraState() {
     mapEditorCameraPosition_ = mapEditorOrthoFocusPosition_;
     mapEditorCameraYawRadians_ = util::mapEditorOrthoYawRadians();
     mapEditorCameraPitchRadians_ = util::mapEditorOrthoPitchRadians();
+}
+
+void Application::focusMapEditorOnProp(const std::size_t index) {
+    if (index >= activeMap_.props.size()) {
+        return;
+    }
+
+    const util::Vec3 focus = clampMapEditorOrthoFocusPosition(activeMap_.props[index].position);
+    if (mapEditorViewMode_ == MapEditorViewMode::Ortho25D) {
+        mapEditorOrthoFocusPosition_ = focus;
+    } else {
+        util::Vec3 nextPosition = addVec3(focus, mapEditorPerspectiveFocusOffset_);
+        const float floorHeight = gameplay::sampleFloorHeight(activeMap_, nextPosition.x, nextPosition.z);
+        nextPosition.y = std::max(nextPosition.y, floorHeight + 1.6f);
+        mapEditorPerspectiveCameraPosition_ = clampMapEditorPerspectiveCameraPosition(nextPosition);
+    }
+
+    syncMapEditorCameraState();
+    syncMapEditorTargetFromView();
+    selectedEditorPropIndex_ = index;
 }
 
 void Application::switchMapEditorViewMode(const MapEditorViewMode nextMode) {
@@ -2896,23 +2941,22 @@ void Application::handleMapEditorInput(const platform::InputSnapshot& input) {
         needsRedraw_ = true;
     }
     if (input.selectSecondaryPressed) {
+        mapEditorTool_ = MapEditorTool::Pan;
+        mapEditorStatus_ = "已切换工具: 抓手";
+        needsRedraw_ = true;
+    }
+    if (input.selectMeleePressed) {
         mapEditorTool_ = MapEditorTool::Place;
         mapEditorStatus_ = std::string("已切换工具: 放置 / ") + mapEditorPlacementKindLabel();
         needsRedraw_ = true;
     }
-    if (input.selectMeleePressed) {
+    if (input.selectThrowablePressed) {
         mapEditorTool_ = MapEditorTool::Erase;
         mapEditorStatus_ = "已切换工具: 擦除";
         needsRedraw_ = true;
     }
-    if (input.selectThrowablePressed) {
-        mapEditorPlacementKind_ = MapEditorPlacementKind::AttackerSpawn;
-        mapEditorTool_ = MapEditorTool::Place;
-        mapEditorStatus_ = std::string("放置类型: ") + mapEditorPlacementKindLabel();
-        needsRedraw_ = true;
-    }
     if (input.selectToolFivePressed) {
-        mapEditorPlacementKind_ = MapEditorPlacementKind::DefenderSpawn;
+        mapEditorPlacementKind_ = MapEditorPlacementKind::AttackerSpawn;
         mapEditorTool_ = MapEditorTool::Place;
         mapEditorStatus_ = std::string("放置类型: ") + mapEditorPlacementKindLabel();
         needsRedraw_ = true;
@@ -2979,12 +3023,16 @@ void Application::handleMapEditorInput(const platform::InputSnapshot& input) {
     }
 
     if (input.primaryClickPressed && !input.secondaryClickHeld) {
-        if (mapEditorTool_ != MapEditorTool::Select) {
+        if (mapEditorTool_ == MapEditorTool::Select && mapEditorViewMode_ == MapEditorViewMode::Ortho25D) {
+            applyMapEditorTool();
+        } else if (mapEditorTool_ != MapEditorTool::Select && mapEditorTool_ != MapEditorTool::Pan) {
             applyMapEditorTool();
         }
         return;
     }
-    if (input.confirmPressed && !input.jumpPressed && mapEditorTool_ != MapEditorTool::Select) {
+    if (input.confirmPressed && !input.jumpPressed &&
+        mapEditorTool_ != MapEditorTool::Select &&
+        mapEditorTool_ != MapEditorTool::Pan) {
         applyMapEditorTool();
     }
 }
@@ -3131,7 +3179,7 @@ void Application::syncMapEditorTargetFromView() {
 
     mapEditorCursorX_ = std::clamp(static_cast<int>(std::floor(mapEditorTargetPosition_.x)), 0, std::max(0, activeMap_.width - 1));
     mapEditorCursorZ_ = std::clamp(static_cast<int>(std::floor(mapEditorTargetPosition_.z)), 0, std::max(0, activeMap_.depth - 1));
-    if (mapEditorTool_ == MapEditorTool::Select) {
+    if (mapEditorTool_ == MapEditorTool::Select && mapEditorViewMode_ == MapEditorViewMode::Perspective) {
         selectedEditorPropIndex_ = hoveredEditorPropIndex_;
     }
 }
@@ -3197,7 +3245,7 @@ bool Application::buildMapEditorRay(util::Vec3& origin, util::Vec3& direction) c
     const int height = std::max(1, window_->clientHeight());
     float sampleX = static_cast<float>(width) * 0.5f;
     float sampleY = static_cast<float>(height) * 0.5f;
-    if (!mapEditorMouseLookActive_) {
+    if (mapEditorViewMode_ == MapEditorViewMode::Ortho25D && !mapEditorMouseLookActive_) {
         sampleX = std::clamp(static_cast<float>(lastInput_.mouseX), 0.0f, static_cast<float>(width - 1)) + 0.5f;
         sampleY = std::clamp(static_cast<float>(lastInput_.mouseY), 0.0f, static_cast<float>(height - 1)) + 0.5f;
     }
@@ -3795,8 +3843,16 @@ void Application::applyMapEditorTool() {
             selectedEditorPropIndex_ = hoveredEditorPropIndex_;
             mapEditorStatus_ = std::string("已锁定对象: ") + propDisplayLabel(activeMap_.props[*hoveredEditorPropIndex_]);
         } else {
-            mapEditorStatus_ = "选择工具会自动锁定光标指中的对象";
+            mapEditorStatus_ = mapEditorViewMode_ == MapEditorViewMode::Perspective
+                ? "选择工具会锁定镜头正前方的对象"
+                : "点击对象即可选中";
         }
+        needsRedraw_ = true;
+        return;
+    }
+
+    if (mapEditorTool_ == MapEditorTool::Pan) {
+        mapEditorStatus_ = "抓手工具用于浏览场景";
         needsRedraw_ = true;
         return;
     }
@@ -4190,6 +4246,8 @@ const char* Application::mapEditorToolLabel() const {
     switch (mapEditorTool_) {
         case MapEditorTool::Select:
             return "选择";
+        case MapEditorTool::Pan:
+            return "抓手";
         case MapEditorTool::Place:
             return "放置";
         case MapEditorTool::Erase:

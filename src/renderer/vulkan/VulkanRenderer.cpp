@@ -1716,6 +1716,7 @@ private:
     struct CachedImGuiPreviewTexture {
         std::string path;
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        TextureResource ownedTexture{};
     };
 
     struct StaticPropBatch {
@@ -3092,6 +3093,9 @@ private:
             if (cached.descriptorSet != VK_NULL_HANDLE) {
                 ImGui_ImplVulkan_RemoveTexture(cached.descriptorSet);
             }
+            if (cached.ownedTexture.valid) {
+                destroyTexture(cached.ownedTexture);
+            }
         }
         imguiPreviewTextures_.clear();
     }
@@ -3769,6 +3773,180 @@ private:
         }
         previewMeshCache_.push_back({key, loadPreviewMeshModel(path)});
         return previewMeshCache_.back().model.valid ? &previewMeshCache_.back().model : nullptr;
+    }
+
+    std::vector<unsigned char> buildPreviewMeshRgba(const PreviewMeshModel& previewModel,
+                                                    const std::uint32_t width,
+                                                    const std::uint32_t height) const {
+        const auto dot = [](const util::Vec3& lhs, const util::Vec3& rhs) {
+            return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
+        };
+        const auto scale = [](const util::Vec3& value, const float scalar) {
+            return util::Vec3{value.x * scalar, value.y * scalar, value.z * scalar};
+        };
+        const auto normalize = [&](const util::Vec3& value) {
+            const float length = std::sqrt(dot(value, value));
+            if (length <= 0.00001f) {
+                return util::Vec3{0.0f, 1.0f, 0.0f};
+            }
+            return scale(value, 1.0f / length);
+        };
+        std::vector<unsigned char> rgba(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4, 255);
+        std::vector<float> depth(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), std::numeric_limits<float>::infinity());
+        for (std::uint32_t y = 0; y < height; ++y) {
+            const float blend = static_cast<float>(y) / std::max(1.0f, static_cast<float>(height - 1));
+            for (std::uint32_t x = 0; x < width; ++x) {
+                const std::size_t index = (static_cast<std::size_t>(y) * width + x) * 4;
+                rgba[index + 0] = static_cast<unsigned char>(std::lround(16.0f + blend * 18.0f));
+                rgba[index + 1] = static_cast<unsigned char>(std::lround(20.0f + blend * 20.0f));
+                rgba[index + 2] = static_cast<unsigned char>(std::lround(24.0f + blend * 28.0f));
+                rgba[index + 3] = 255;
+            }
+        }
+
+        const float centerX = static_cast<float>(width) * 0.5f;
+        const float centerY = static_cast<float>(height) * 0.56f;
+        const float previewScale = std::min(static_cast<float>(width), static_cast<float>(height)) * 0.34f /
+            std::max(0.001f, previewModel.radius);
+        const float yaw = 0.72f;
+        const float pitch = -0.48f;
+        const float cosYaw = std::cos(yaw);
+        const float sinYaw = std::sin(yaw);
+        const float cosPitch = std::cos(pitch);
+        const float sinPitch = std::sin(pitch);
+        const float cameraDistance = previewModel.radius * 4.2f;
+
+        std::vector<ProjectedVertex> projected;
+        projected.reserve(previewModel.vertices.size());
+        std::vector<util::Vec3> transformed;
+        transformed.reserve(previewModel.vertices.size());
+        for (const auto& source : previewModel.vertices) {
+            util::Vec3 vertex{
+                source.x - previewModel.center.x,
+                source.y - previewModel.center.y,
+                source.z - previewModel.center.z,
+            };
+            const float yawX = vertex.x * cosYaw - vertex.z * sinYaw;
+            const float yawZ = vertex.x * sinYaw + vertex.z * cosYaw;
+            const float pitchY = vertex.y * cosPitch - yawZ * sinPitch;
+            const float pitchZ = vertex.y * sinPitch + yawZ * cosPitch + cameraDistance;
+            transformed.push_back({yawX, pitchY, pitchZ});
+            projected.push_back({centerX + (yawX / pitchZ) * previewScale, centerY - (pitchY / pitchZ) * previewScale, pitchZ});
+        }
+
+        const auto edge = [](const ProjectedVertex& a, const ProjectedVertex& b, const float px, const float py) {
+            return (px - a.x) * (b.y - a.y) - (py - a.y) * (b.x - a.x);
+        };
+
+        const util::Vec3 lightDir = normalize({-0.45f, 0.72f, -0.54f});
+        for (const auto& triangle : previewModel.triangles) {
+            if (triangle.a >= projected.size() || triangle.b >= projected.size() || triangle.c >= projected.size()) {
+                continue;
+            }
+            const auto& pa = projected[triangle.a];
+            const auto& pb = projected[triangle.b];
+            const auto& pc = projected[triangle.c];
+            if (pa.z <= 0.01f || pb.z <= 0.01f || pc.z <= 0.01f) {
+                continue;
+            }
+            const auto& va = transformed[triangle.a];
+            const auto& vb = transformed[triangle.b];
+            const auto& vc = transformed[triangle.c];
+            const util::Vec3 ab{vb.x - va.x, vb.y - va.y, vb.z - va.z};
+            const util::Vec3 ac{vc.x - va.x, vc.y - va.y, vc.z - va.z};
+            const util::Vec3 normal{
+                ab.y * ac.z - ab.z * ac.y,
+                ab.z * ac.x - ab.x * ac.z,
+                ab.x * ac.y - ab.y * ac.x,
+            };
+            if (normal.z >= 0.0f) {
+                continue;
+            }
+
+            const float area = edge(pa, pb, pc.x, pc.y);
+            if (std::abs(area) <= 0.0001f) {
+                continue;
+            }
+
+            const util::Vec3 normalDir = normalize(normal);
+            const float light = std::clamp(dot(normalDir, scale(lightDir, -1.0f)), 0.0f, 1.0f);
+            const util::Vec3 shade = {
+                std::clamp(triangle.color.x * (0.26f + light * 0.74f), 0.0f, 1.0f),
+                std::clamp(triangle.color.y * (0.26f + light * 0.74f), 0.0f, 1.0f),
+                std::clamp(triangle.color.z * (0.26f + light * 0.74f), 0.0f, 1.0f),
+            };
+
+            const int minX = std::max(0, static_cast<int>(std::floor(std::min({pa.x, pb.x, pc.x}))));
+            const int maxX = std::min(static_cast<int>(width) - 1, static_cast<int>(std::ceil(std::max({pa.x, pb.x, pc.x}))));
+            const int minY = std::max(0, static_cast<int>(std::floor(std::min({pa.y, pb.y, pc.y}))));
+            const int maxY = std::min(static_cast<int>(height) - 1, static_cast<int>(std::ceil(std::max({pa.y, pb.y, pc.y}))));
+            for (int y = minY; y <= maxY; ++y) {
+                for (int x = minX; x <= maxX; ++x) {
+                    const float px = static_cast<float>(x) + 0.5f;
+                    const float py = static_cast<float>(y) + 0.5f;
+                    const float w0 = edge(pb, pc, px, py) / area;
+                    const float w1 = edge(pc, pa, px, py) / area;
+                    const float w2 = edge(pa, pb, px, py) / area;
+                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
+                        continue;
+                    }
+                    const float z = pa.z * w0 + pb.z * w1 + pc.z * w2;
+                    const std::size_t pixelIndex = static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x);
+                    if (z >= depth[pixelIndex]) {
+                        continue;
+                    }
+                    depth[pixelIndex] = z;
+                    const std::size_t colorIndex = pixelIndex * 4;
+                    rgba[colorIndex + 0] = static_cast<unsigned char>(std::lround(shade.x * 255.0f));
+                    rgba[colorIndex + 1] = static_cast<unsigned char>(std::lround(shade.y * 255.0f));
+                    rgba[colorIndex + 2] = static_cast<unsigned char>(std::lround(shade.z * 255.0f));
+                    rgba[colorIndex + 3] = 255;
+                }
+            }
+        }
+
+        return rgba;
+    }
+
+    ImTextureID cachedImGuiPreviewTextureForObject(const std::filesystem::path& thumbnailPath,
+                                                   const std::filesystem::path& modelPath) {
+        if (!thumbnailPath.empty()) {
+            if (ImTextureID image = cachedImGuiPreviewTexture(thumbnailPath); image != 0) {
+                return image;
+            }
+        }
+        if (!imguiInitialized_ || !imguiVulkanBackendInitialized_ || modelPath.empty()) {
+            return static_cast<ImTextureID>(0);
+        }
+
+        const std::string key = std::string("model-preview:") + modelPath.generic_string();
+        for (const auto& cached : imguiPreviewTextures_) {
+            if (cached.path == key) {
+                return reinterpret_cast<ImTextureID>(cached.descriptorSet);
+            }
+        }
+
+        const PreviewMeshModel* previewModel = cachedPreviewMeshModel(modelPath);
+        if (previewModel == nullptr || !previewModel->valid) {
+            return static_cast<ImTextureID>(0);
+        }
+
+        CachedImGuiPreviewTexture cached{};
+        cached.path = key;
+        const std::vector<unsigned char> rgba = buildPreviewMeshRgba(*previewModel, 192, 192);
+        if (!createTextureFromRgba(rgba.data(), 192, 192, cached.ownedTexture)) {
+            return static_cast<ImTextureID>(0);
+        }
+        cached.descriptorSet = ImGui_ImplVulkan_AddTexture(
+            textureSampler_,
+            cached.ownedTexture.view,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (cached.descriptorSet == VK_NULL_HANDLE) {
+            destroyTexture(cached.ownedTexture);
+            return static_cast<ImTextureID>(0);
+        }
+        imguiPreviewTextures_.push_back(std::move(cached));
+        return reinterpret_cast<ImTextureID>(imguiPreviewTextures_.back().descriptorSet);
     }
 
     void recordEquipmentPreview(const VkCommandBuffer commandBuffer, const RenderFrame& renderFrame) {
@@ -4757,6 +4935,7 @@ private:
     std::string staticPropBatchCacheKey_;
     std::array<char, 128> multiplayerHostDraft_{};
     std::array<char, 128> editorModelFilter_{};
+    std::array<char, 128> editorSceneFilter_{};
     std::array<char, 128> managedObjectFilter_{};
     std::array<char, 128> managedObjectIdDraft_{};
     std::array<char, 128> managedObjectLabelDraft_{};
@@ -4765,6 +4944,10 @@ private:
     std::array<char, 256> managedObjectMaterialPathDraft_{};
     std::array<char, 256> managedObjectTagsDraft_{};
     std::string managedObjectDraftFingerprint_;
+    MapEditorTopTab selectedMapEditorTopTab_ = MapEditorTopTab::Scene;
+    float editorSidebarWidthDraft_ = 0.0f;
+    bool editorSidebarWidthDragging_ = false;
+    bool editorSidebarResizeDirty_ = false;
     int managedObjectPlacementKindDraft_ = 0;
     bool managedObjectCylindricalDraft_ = false;
     bool managedObjectEditorVisibleDraft_ = true;

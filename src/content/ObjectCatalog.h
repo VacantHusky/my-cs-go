@@ -42,7 +42,7 @@ struct ObjectCatalog {
 };
 
 ObjectCatalog buildDefaultObjectCatalog(const std::filesystem::path& assetRoot, const AssetManifest& manifest);
-ObjectCatalog loadObjectCatalog(const std::filesystem::path& assetRoot, const std::filesystem::path& path);
+ObjectCatalog loadObjectCatalog(const std::filesystem::path& assetRoot, const std::filesystem::path& path, const AssetManifest& manifest);
 bool writeObjectCatalog(const std::filesystem::path& assetRoot, const ObjectCatalog& catalog);
 
 }  // namespace mycsg::content

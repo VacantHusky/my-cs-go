@@ -235,6 +235,10 @@ std::filesystem::path objectThumbnailPathFor(const AssetManifest& manifest,
     return {};
 }
 
+bool pathEqualsNormalized(const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+    return lhs.lexically_normal().generic_string() == rhs.lexically_normal().generic_string();
+}
+
 const ObjectAssetDefinition* matchLegacyObjectAsset(const ObjectCatalog& catalog,
                                                     const std::filesystem::path& assetRoot,
                                                     const gameplay::MapProp& prop) {
@@ -545,7 +549,7 @@ void ContentDatabase::createObjectCatalog(const std::filesystem::path& assetRoot
     ObjectCatalog catalog = buildDefaultObjectCatalog(assetRoot, assetManifest_);
     const std::filesystem::path catalogPath = assetRoot / catalog.catalogPath;
     if (util::FileSystem::exists(catalogPath)) {
-        const ObjectCatalog loadedCatalog = loadObjectCatalog(assetRoot, catalogPath);
+        const ObjectCatalog loadedCatalog = loadObjectCatalog(assetRoot, catalogPath, assetManifest_);
         for (const auto& object : loadedCatalog.objects) {
             catalog.upsert(object);
         }
@@ -636,10 +640,26 @@ void ContentDatabase::resolveMapData(gameplay::MapData& map) const {
 bool ContentDatabase::upsertObjectAsset(ObjectAssetDefinition definition) {
     definition.modelPath = normalizeCatalogPath(assetRoot_, definition.modelPath);
     definition.materialPath = normalizeCatalogPath(assetRoot_, definition.materialPath);
-    if (definition.thumbnailPath.empty()) {
-        definition.thumbnailPath = objectThumbnailPathFor(assetManifest_, definition.modelPath, definition.materialPath);
-    } else {
+    const ObjectAssetDefinition* existing = objectCatalog_.find(definition.id);
+    const std::filesystem::path derivedThumbnailPath =
+        objectThumbnailPathFor(assetManifest_, definition.modelPath, definition.materialPath);
+    if (!definition.thumbnailPath.empty()) {
         definition.thumbnailPath = normalizeCatalogPath(assetRoot_, definition.thumbnailPath);
+    }
+    if (definition.thumbnailPath.empty()) {
+        definition.thumbnailPath = derivedThumbnailPath;
+    } else if (existing != nullptr) {
+        const std::filesystem::path existingDerivedThumbnailPath =
+            objectThumbnailPathFor(assetManifest_, existing->modelPath, existing->materialPath);
+        const bool sourceAssetChanged =
+            !pathEqualsNormalized(existing->modelPath, definition.modelPath) ||
+            !pathEqualsNormalized(existing->materialPath, definition.materialPath);
+        const bool existingThumbnailWasDerived =
+            existing->thumbnailPath.empty() ||
+            pathEqualsNormalized(existing->thumbnailPath, existingDerivedThumbnailPath);
+        if (sourceAssetChanged && existingThumbnailWasDerived) {
+            definition.thumbnailPath = derivedThumbnailPath;
+        }
     }
     if (!objectCatalog_.upsert(std::move(definition))) {
         return false;

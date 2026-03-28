@@ -1,10 +1,12 @@
 #include "content/AssetManifest.h"
 
+#include "renderer/vulkan/MeshRuntime.h"
 #include "util/FileSystem.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <limits>
@@ -147,6 +149,239 @@ std::vector<std::byte> makeCheckerBmp(const std::uint8_t r, const std::uint8_t g
     }
 
     return bytes;
+}
+
+std::vector<std::byte> makeBmpFromRgbBuffer(const int width,
+                                            const int height,
+                                            const std::vector<std::uint8_t>& pixels) {
+    constexpr int kBytesPerPixel = 3;
+    const int rowStride = ((width * kBytesPerPixel + 3) / 4) * 4;
+    const int pixelDataSize = rowStride * height;
+    const int fileSize = 14 + 40 + pixelDataSize;
+
+    std::vector<std::byte> bytes(static_cast<std::size_t>(fileSize), std::byte{0});
+    auto writeU16 = [&](const std::size_t offset, const std::uint16_t value) {
+        bytes[offset + 0] = static_cast<std::byte>(value & 0xff);
+        bytes[offset + 1] = static_cast<std::byte>((value >> 8) & 0xff);
+    };
+    auto writeU32 = [&](const std::size_t offset, const std::uint32_t value) {
+        bytes[offset + 0] = static_cast<std::byte>(value & 0xff);
+        bytes[offset + 1] = static_cast<std::byte>((value >> 8) & 0xff);
+        bytes[offset + 2] = static_cast<std::byte>((value >> 16) & 0xff);
+        bytes[offset + 3] = static_cast<std::byte>((value >> 24) & 0xff);
+    };
+
+    writeU16(0, 0x4d42);
+    writeU32(2, static_cast<std::uint32_t>(fileSize));
+    writeU32(10, 54);
+    writeU32(14, 40);
+    writeU32(18, static_cast<std::uint32_t>(width));
+    writeU32(22, static_cast<std::uint32_t>(height));
+    writeU16(26, 1);
+    writeU16(28, 24);
+    writeU32(34, static_cast<std::uint32_t>(pixelDataSize));
+
+    for (int y = 0; y < height; ++y) {
+        const int srcY = height - 1 - y;
+        const std::size_t srcOffset = static_cast<std::size_t>(srcY * width * kBytesPerPixel);
+        const std::size_t dstOffset = static_cast<std::size_t>(54 + y * rowStride);
+        for (int x = 0; x < width; ++x) {
+            const std::size_t srcIndex = srcOffset + static_cast<std::size_t>(x * kBytesPerPixel);
+            const std::size_t dstIndex = dstOffset + static_cast<std::size_t>(x * kBytesPerPixel);
+            bytes[dstIndex + 0] = static_cast<std::byte>(pixels[srcIndex + 2]);
+            bytes[dstIndex + 1] = static_cast<std::byte>(pixels[srcIndex + 1]);
+            bytes[dstIndex + 2] = static_cast<std::byte>(pixels[srcIndex + 0]);
+        }
+    }
+    return bytes;
+}
+
+util::Vec3 subtractVec3(const util::Vec3& lhs, const util::Vec3& rhs) {
+    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
+}
+
+util::Vec3 multiplyVec3(const util::Vec3& value, const float scalar) {
+    return {value.x * scalar, value.y * scalar, value.z * scalar};
+}
+
+float dotVec3(const util::Vec3& lhs, const util::Vec3& rhs) {
+    return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
+}
+
+util::Vec3 crossVec3(const util::Vec3& lhs, const util::Vec3& rhs) {
+    return {
+        lhs.y * rhs.z - lhs.z * rhs.y,
+        lhs.z * rhs.x - lhs.x * rhs.z,
+        lhs.x * rhs.y - lhs.y * rhs.x,
+    };
+}
+
+float lengthVec3(const util::Vec3& value) {
+    return std::sqrt(dotVec3(value, value));
+}
+
+util::Vec3 normalizeVec3(const util::Vec3& value) {
+    const float length = lengthVec3(value);
+    if (length <= 0.00001f) {
+        return {0.0f, 1.0f, 0.0f};
+    }
+    return multiplyVec3(value, 1.0f / length);
+}
+
+float clamp01(const float value) {
+    return std::clamp(value, 0.0f, 1.0f);
+}
+
+std::filesystem::path generatedModelThumbnailPath(const std::filesystem::path& relativeModelPath) {
+    return std::filesystem::path(kThumbnailRoot) / "models" /
+        (sanitizeId(relativeModelPath.generic_string()) + ".bmp");
+}
+
+std::filesystem::path generateModelThumbnail(const std::filesystem::path& assetRoot,
+                                             const std::filesystem::path& absoluteModelPath,
+                                             const std::filesystem::path& relativeModelPath) {
+    const std::filesystem::path outputRelativePath = generatedModelThumbnailPath(relativeModelPath);
+    const std::filesystem::path outputAbsolutePath = assetRoot / outputRelativePath;
+    if (util::FileSystem::exists(outputAbsolutePath)) {
+        return outputRelativePath;
+    }
+
+    const renderer::vulkan::CpuMesh mesh = renderer::vulkan::loadMeshFromSource(absoluteModelPath);
+    if (!mesh.valid || mesh.vertices.size() < 3) {
+        return {};
+    }
+
+    constexpr int kSize = 192;
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(kSize * kSize * 3), 0);
+    std::vector<float> depth(static_cast<std::size_t>(kSize * kSize), std::numeric_limits<float>::infinity());
+    for (int y = 0; y < kSize; ++y) {
+        for (int x = 0; x < kSize; ++x) {
+            const float blend = clamp01(static_cast<float>(y) / static_cast<float>(kSize - 1));
+            const std::uint8_t r = static_cast<std::uint8_t>(std::lround(18.0f + blend * 18.0f));
+            const std::uint8_t g = static_cast<std::uint8_t>(std::lround(22.0f + blend * 20.0f));
+            const std::uint8_t b = static_cast<std::uint8_t>(std::lround(28.0f + blend * 24.0f));
+            const std::size_t index = static_cast<std::size_t>((y * kSize + x) * 3);
+            pixels[index + 0] = r;
+            pixels[index + 1] = g;
+            pixels[index + 2] = b;
+        }
+    }
+
+    const float yaw = 0.72f;
+    const float pitch = -0.48f;
+    const float cosYaw = std::cos(yaw);
+    const float sinYaw = std::sin(yaw);
+    const float cosPitch = std::cos(pitch);
+    const float sinPitch = std::sin(pitch);
+    const float invRadius = 1.0f / std::max(0.001f, mesh.radius);
+    const float cameraDistance = 3.8f;
+    const float projectionScale = static_cast<float>(kSize) * 0.42f;
+    const float centerX = static_cast<float>(kSize) * 0.5f;
+    const float centerY = static_cast<float>(kSize) * 0.56f;
+    const util::Vec3 lightDirection = normalizeVec3({-0.45f, 0.72f, -0.54f});
+
+    struct ProjectedVertex {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+    };
+
+    auto transformVertex = [&](const renderer::vulkan::MeshVertex& source) {
+        util::Vec3 p = {
+            (source.px - mesh.center.x) * invRadius,
+            (source.py - mesh.center.y) * invRadius,
+            (source.pz - mesh.center.z) * invRadius,
+        };
+        const float yawX = p.x * cosYaw - p.z * sinYaw;
+        const float yawZ = p.x * sinYaw + p.z * cosYaw;
+        const float pitchY = p.y * cosPitch - yawZ * sinPitch;
+        const float pitchZ = p.y * sinPitch + yawZ * cosPitch + cameraDistance;
+        return util::Vec3{yawX, pitchY, pitchZ};
+    };
+
+    auto projectVertex = [&](const util::Vec3& value) {
+        return ProjectedVertex{
+            centerX + (value.x / value.z) * projectionScale,
+            centerY - (value.y / value.z) * projectionScale,
+            value.z,
+        };
+    };
+
+    auto edge = [](const ProjectedVertex& a, const ProjectedVertex& b, const float px, const float py) {
+        return (px - a.x) * (b.y - a.y) - (py - a.y) * (b.x - a.x);
+    };
+
+    for (std::size_t index = 0; index + 2 < mesh.vertices.size(); index += 3) {
+        const auto& va = mesh.vertices[index + 0];
+        const auto& vb = mesh.vertices[index + 1];
+        const auto& vc = mesh.vertices[index + 2];
+        const util::Vec3 ta = transformVertex(va);
+        const util::Vec3 tb = transformVertex(vb);
+        const util::Vec3 tc = transformVertex(vc);
+        if (ta.z <= 0.01f || tb.z <= 0.01f || tc.z <= 0.01f) {
+            continue;
+        }
+
+        const util::Vec3 normal = crossVec3(subtractVec3(tb, ta), subtractVec3(tc, ta));
+        const util::Vec3 normalizedNormal = normalizeVec3(normal);
+        if (normalizedNormal.z >= -0.02f) {
+            continue;
+        }
+
+        const ProjectedVertex pa = projectVertex(ta);
+        const ProjectedVertex pb = projectVertex(tb);
+        const ProjectedVertex pc = projectVertex(tc);
+        const float minX = std::floor(std::min({pa.x, pb.x, pc.x}));
+        const float maxX = std::ceil(std::max({pa.x, pb.x, pc.x}));
+        const float minY = std::floor(std::min({pa.y, pb.y, pc.y}));
+        const float maxY = std::ceil(std::max({pa.y, pb.y, pc.y}));
+        const int x0 = std::clamp(static_cast<int>(minX), 0, kSize - 1);
+        const int x1 = std::clamp(static_cast<int>(maxX), 0, kSize - 1);
+        const int y0 = std::clamp(static_cast<int>(minY), 0, kSize - 1);
+        const int y1 = std::clamp(static_cast<int>(maxY), 0, kSize - 1);
+        const float area = edge(pa, pb, pc.x, pc.y);
+        if (std::abs(area) <= 0.00001f) {
+            continue;
+        }
+
+        const util::Vec3 baseColor = {
+            (va.r + vb.r + vc.r) / 3.0f,
+            (va.g + vb.g + vc.g) / 3.0f,
+            (va.b + vb.b + vc.b) / 3.0f,
+        };
+        const float light = 0.28f + 0.72f * clamp01(dotVec3(normalizedNormal, multiplyVec3(lightDirection, -1.0f)));
+        const std::uint8_t r = static_cast<std::uint8_t>(std::lround(clamp01(baseColor.x * light) * 255.0f));
+        const std::uint8_t g = static_cast<std::uint8_t>(std::lround(clamp01(baseColor.y * light) * 255.0f));
+        const std::uint8_t b = static_cast<std::uint8_t>(std::lround(clamp01(baseColor.z * light) * 255.0f));
+
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const float px = static_cast<float>(x) + 0.5f;
+                const float py = static_cast<float>(y) + 0.5f;
+                const float w0 = edge(pb, pc, px, py) / area;
+                const float w1 = edge(pc, pa, px, py) / area;
+                const float w2 = edge(pa, pb, px, py) / area;
+                if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
+                    continue;
+                }
+                const float z = pa.z * w0 + pb.z * w1 + pc.z * w2;
+                const std::size_t pixelIndex = static_cast<std::size_t>(y * kSize + x);
+                if (z >= depth[pixelIndex]) {
+                    continue;
+                }
+                depth[pixelIndex] = z;
+                const std::size_t colorIndex = pixelIndex * 3;
+                pixels[colorIndex + 0] = r;
+                pixels[colorIndex + 1] = g;
+                pixels[colorIndex + 2] = b;
+            }
+        }
+    }
+
+    if (!util::FileSystem::writeBinary(outputAbsolutePath, makeBmpFromRgbBuffer(kSize, kSize, pixels))) {
+        return {};
+    }
+    return outputRelativePath;
 }
 
 std::string escapeJson(const std::string_view value) {
@@ -469,6 +704,17 @@ std::filesystem::path resolveModelThumbnailPath(const std::filesystem::path& ass
             }
         }
         ancestor = ancestor.parent_path();
+    }
+
+    const std::string extension = lowerAscii(absoluteModelPath.extension().string());
+    if (hasSupportedModelExtension(extension)) {
+        const std::filesystem::path generatedThumbnail = generateModelThumbnail(
+            assetRoot,
+            absoluteModelPath,
+            relativeToRoot(assetRoot, absoluteModelPath));
+        if (!generatedThumbnail.empty()) {
+            return generatedThumbnail;
+        }
     }
 
     return fallbackThumbnailPathForCategory(assetRoot, categoryLabel);

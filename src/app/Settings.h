@@ -12,6 +12,7 @@ struct VideoSettings {
     bool fullscreen = false;
     float renderScale = 1.0f;
     std::string antialiasing = "TAA";
+    float editorSidebarWidth = 520.0f;
 };
 
 struct AudioSettings {

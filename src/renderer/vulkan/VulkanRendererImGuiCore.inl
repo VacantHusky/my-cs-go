@@ -101,6 +101,7 @@
         applyImGuiStyle();
 
         std::filesystem::path fontPath = resolveImGuiFontPath();
+        std::filesystem::path iconFontPath = resolveImGuiIconFontPath();
         ImFontConfig fontConfig{};
         fontConfig.OversampleH = 2;
         fontConfig.OversampleV = 2;
@@ -122,6 +123,30 @@
         if (io.Fonts->Fonts.empty()) {
             io.Fonts->AddFontDefault();
             spdlog::warn("[ImGui] Falling back to default font; Chinese glyph coverage may be limited.");
+        }
+        static const ImWchar iconGlyphRanges[] = {
+            0x002B, 0x002B,
+            0xF030, 0xF030,
+            0xF05B, 0xF05B,
+            0xF065, 0xF065,
+            0xF1B2, 0xF1B2,
+            0xF1F8, 0xF1F8,
+            0xF255, 0xF255,
+            0xF5EE, 0xF5EE,
+            0,
+        };
+        if (!iconFontPath.empty()) {
+            ImFontConfig iconFontConfig{};
+            iconFontConfig.MergeMode = true;
+            iconFontConfig.PixelSnapH = true;
+            iconFontConfig.OversampleH = 2;
+            iconFontConfig.OversampleV = 2;
+            iconFontConfig.GlyphOffset = ImVec2(0.0f, 1.0f);
+            if (io.Fonts->AddFontFromFileTTF(iconFontPath.string().c_str(), 18.0f, &iconFontConfig, iconGlyphRanges) != nullptr) {
+                spdlog::info("[ImGui] Loaded icon font: {}", iconFontPath.generic_string());
+            } else {
+                spdlog::warn("[ImGui] Failed to load icon font: {}", iconFontPath.generic_string());
+            }
         }
 
         if (!ImGui_ImplSDL3_InitForVulkan(sdlWindow_)) {
@@ -211,16 +236,19 @@
     void applyImGuiStyle() {
         ImGui::StyleColorsDark();
         ImGuiStyle& style = ImGui::GetStyle();
-        style.WindowRounding = 10.0f;
-        style.ChildRounding = 8.0f;
-        style.FrameRounding = 8.0f;
-        style.GrabRounding = 8.0f;
-        style.PopupRounding = 8.0f;
-        style.ScrollbarRounding = 8.0f;
-        style.TabRounding = 8.0f;
-        style.WindowPadding = ImVec2(14.0f, 12.0f);
-        style.FramePadding = ImVec2(10.0f, 6.0f);
-        style.ItemSpacing = ImVec2(10.0f, 8.0f);
+        style.WindowRounding = 8.0f;
+        style.ChildRounding = 6.0f;
+        style.FrameRounding = 6.0f;
+        style.GrabRounding = 6.0f;
+        style.PopupRounding = 6.0f;
+        style.ScrollbarRounding = 6.0f;
+        style.TabRounding = 6.0f;
+        style.WindowPadding = ImVec2(10.0f, 9.0f);
+        style.FramePadding = ImVec2(8.0f, 5.0f);
+        style.ItemSpacing = ImVec2(8.0f, 6.0f);
+        style.CellPadding = ImVec2(6.0f, 4.0f);
+        style.IndentSpacing = 14.0f;
+        style.ScrollbarSize = 12.0f;
         style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.10f, 0.13f, 0.92f);
         style.Colors[ImGuiCol_TitleBg] = ImVec4(0.14f, 0.20f, 0.27f, 1.00f);
         style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.19f, 0.31f, 0.42f, 1.00f);
@@ -255,6 +283,29 @@
             std::filesystem::path(),
             std::filesystem::path(),
             std::filesystem::path(),
+            std::filesystem::path(),
+#endif
+        }};
+
+        for (const auto& candidate : candidates) {
+            if (candidate.empty()) {
+                continue;
+            }
+            if (std::filesystem::exists(candidate, error) && !error) {
+                return candidate;
+            }
+            error.clear();
+        }
+        return {};
+    }
+
+    std::filesystem::path resolveImGuiIconFontPath() const {
+        std::error_code error;
+        const std::array<std::filesystem::path, 2> candidates{{
+            std::filesystem::path("assets/fonts/fa-solid-900.ttf"),
+#ifdef MYCSGO_ASSET_ROOT
+            std::filesystem::path(MYCSGO_ASSET_ROOT) / "fonts" / "fa-solid-900.ttf",
+#else
             std::filesystem::path(),
 #endif
         }};

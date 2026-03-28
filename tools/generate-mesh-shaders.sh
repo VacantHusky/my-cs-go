@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GLSLANG_BIN="$ROOT_DIR/.local-tools/build/glslang-host/StandAlone/glslang"
+GLSLANG_BIN="${GLSLANG_BIN:-$(command -v glslangValidator || command -v glslang || true)}"
 OUT_DIR="$ROOT_DIR/assets/generated/shaders"
 VERT_SRC="$ROOT_DIR/src/renderer/vulkan/shaders/mesh.vert"
 FRAG_SRC="$ROOT_DIR/src/renderer/vulkan/shaders/mesh.frag"
@@ -22,7 +22,7 @@ if [[ ! -x "$GLSLANG_BIN" ]]; then
         echo "Using existing generated Vulkan shaders."
         exit 0
     fi
-    echo "Missing glslang compiler at $GLSLANG_BIN" >&2
+    echo "glslangValidator was not found in PATH. Please install the system glslang-tools package." >&2
     exit 1
 fi
 

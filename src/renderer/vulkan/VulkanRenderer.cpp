@@ -38,6 +38,7 @@
 #include <vk_mem_alloc.h>
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -89,7 +90,9 @@ public:
             spdlog::error("Failed to load vulkan-1.dll.");
             return false;
         }
-        vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(module_, "vkGetInstanceProcAddr"));
+        const FARPROC getInstanceProcAddr = GetProcAddress(module_, "vkGetInstanceProcAddr");
+        static_assert(sizeof(PFN_vkGetInstanceProcAddr) == sizeof(getInstanceProcAddr));
+        vkGetInstanceProcAddr = std::bit_cast<PFN_vkGetInstanceProcAddr>(getInstanceProcAddr);
 #else
         module_ = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
         if (module_ == nullptr) {
@@ -1554,7 +1557,23 @@ void recordFilledTriangle(VulkanDispatch& dispatch,
         if (count < 2) {
             continue;
         }
-        std::sort(intersections.begin(), intersections.begin() + count);
+
+        if (count == 2) {
+            if (intersections[1] < intersections[0]) {
+                std::swap(intersections[0], intersections[1]);
+            }
+        } else if (count == 3) {
+            if (intersections[1] < intersections[0]) {
+                std::swap(intersections[0], intersections[1]);
+            }
+            if (intersections[2] < intersections[1]) {
+                std::swap(intersections[1], intersections[2]);
+            }
+            if (intersections[1] < intersections[0]) {
+                std::swap(intersections[0], intersections[1]);
+            }
+        }
+
         clearRect(dispatch, commandBuffer, attachment, makePixelRect(
             extent,
             intersections[0],
@@ -2194,9 +2213,11 @@ private:
             ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST
             : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         allocInfo.requiredFlags = properties;
-        allocInfo.flags = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0
-            ? VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-            : 0u;
+        allocInfo.flags = static_cast<VmaAllocationCreateFlags>(0);
+        if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            allocInfo.flags = static_cast<VmaAllocationCreateFlags>(
+                allocInfo.flags | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        }
         return vmaCreateBuffer(allocator_, &bufferInfo, &allocInfo, &buffer, &allocation, nullptr) == VK_SUCCESS;
     }
 

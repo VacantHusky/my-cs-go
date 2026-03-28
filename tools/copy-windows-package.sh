@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="$ROOT_DIR/build/windows-x64-llvm-mingw"
-DEFAULT_DEST_DIR="/mnt/e/111222/windows-x64-llvm-mingw"
+BUILD_DIR="$ROOT_DIR/build/windows-x64-mingw"
+DEFAULT_DEST_DIR="$ROOT_DIR/dist/windows-x64-mingw"
 DEST_DIR="${1:-$DEFAULT_DEST_DIR}"
 ASSET_DIR="$ROOT_DIR/assets"
 

@@ -1,0 +1,38 @@
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+
+find_program(MYCSGO_MINGW_C_COMPILER
+    NAMES x86_64-w64-mingw32-gcc x86_64-w64-mingw32-clang
+    REQUIRED
+)
+find_program(MYCSGO_MINGW_CXX_COMPILER
+    NAMES x86_64-w64-mingw32-g++ x86_64-w64-mingw32-clang++
+    REQUIRED
+)
+find_program(MYCSGO_MINGW_RC_COMPILER
+    NAMES x86_64-w64-mingw32-windres llvm-windres
+    REQUIRED
+)
+find_program(MYCSGO_MINGW_AR
+    NAMES x86_64-w64-mingw32-gcc-ar x86_64-w64-mingw32-ar x86_64-w64-mingw32-llvm-ar
+    REQUIRED
+)
+find_program(MYCSGO_MINGW_RANLIB
+    NAMES x86_64-w64-mingw32-gcc-ranlib x86_64-w64-mingw32-ranlib x86_64-w64-mingw32-llvm-ranlib
+    REQUIRED
+)
+
+set(CMAKE_C_COMPILER "${MYCSGO_MINGW_C_COMPILER}")
+set(CMAKE_CXX_COMPILER "${MYCSGO_MINGW_CXX_COMPILER}")
+set(CMAKE_RC_COMPILER "${MYCSGO_MINGW_RC_COMPILER}")
+set(CMAKE_AR "${MYCSGO_MINGW_AR}")
+set(CMAKE_RANLIB "${MYCSGO_MINGW_RANLIB}")
+
+if(EXISTS "/usr/x86_64-w64-mingw32")
+    list(APPEND CMAKE_FIND_ROOT_PATH "/usr/x86_64-w64-mingw32")
+endif()
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)

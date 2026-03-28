@@ -2,29 +2,36 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="$ROOT_DIR/.local-tools/host-tools"
+BUILD_DIR="$ROOT_DIR/build/host-tools"
 SRC="$ROOT_DIR/tools/font_atlas_baker.cpp"
 BIN="$BUILD_DIR/font_atlas_baker"
 CHARSET="$ROOT_DIR/tools/ui_font_charset.txt"
 MERGED_CHARSET="$BUILD_DIR/ui_font_charset_merged.txt"
 OUT_HEADER="$ROOT_DIR/src/renderer/font/GeneratedUiFontData.h"
 OUT_SOURCE="$ROOT_DIR/src/renderer/font/GeneratedUiFontData.cpp"
+PROJECT_FONT="$ROOT_DIR/assets/fonts/NotoSansSC-Variable.ttf"
 
 mkdir -p "$BUILD_DIR"
 
-FONT_PATH=""
-for candidate in \
-  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc" \
-  "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
-do
-  if [[ -f "$candidate" ]]; then
-    FONT_PATH="$candidate"
-    break
-  fi
-done
+FONT_PATH="${FONT_PATH:-}"
+if [[ -z "$FONT_PATH" && -f "$PROJECT_FONT" ]]; then
+  FONT_PATH="$PROJECT_FONT"
+fi
 
 if [[ -z "$FONT_PATH" ]]; then
-  echo "Could not find a Noto Sans CJK font." >&2
+  for candidate in \
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc" \
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+  do
+    if [[ -f "$candidate" ]]; then
+      FONT_PATH="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$FONT_PATH" ]]; then
+  echo "Could not find a UI font. Set FONT_PATH, add assets/fonts/NotoSansSC-Variable.ttf, or install Noto Sans CJK." >&2
   exit 1
 fi
 

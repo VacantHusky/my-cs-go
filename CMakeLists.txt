@@ -56,6 +56,10 @@ target_compile_definitions(mycsg_imgui PUBLIC
     VK_NO_PROTOTYPES
 )
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(mycsg_imgui PRIVATE -Wno-stringop-overflow)
+endif()
+
 target_compile_definitions(mycsg_fastgltf PUBLIC
     FASTGLTF_USE_CUSTOM_SMALLVECTOR=0
     FASTGLTF_ENABLE_DEPRECATED_EXT=0
@@ -88,15 +92,28 @@ set(MYCSGO_APP_SOURCES
     src/util/Log.cpp
 )
 
-set(MYCSGO_LOCAL_VULKAN_HEADERS "${CMAKE_SOURCE_DIR}/.local-tools/vendor/Vulkan-Headers-vulkan-sdk-1.4.341.0/include")
-if(EXISTS "${MYCSGO_LOCAL_VULKAN_HEADERS}/vulkan/vulkan.h")
-    set(MYCSGO_VULKAN_INCLUDE_DIR "${MYCSGO_LOCAL_VULKAN_HEADERS}")
-else()
-    find_path(MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
-    if(NOT MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR)
-        message(FATAL_ERROR "Vulkan headers were not found. Install Vulkan SDK or populate .local-tools/vendor/Vulkan-Headers-*/include.")
+find_path(MYCSGO_VULKAN_INCLUDE_DIR vulkan/vulkan.h
+    HINTS
+        "$ENV{VULKAN_SDK}/Include"
+        "$ENV{VULKAN_SDK}/include"
+        /usr/include
+        /usr/local/include
+    NO_CMAKE_FIND_ROOT_PATH
+)
+if(NOT MYCSGO_VULKAN_INCLUDE_DIR)
+    message(FATAL_ERROR "Vulkan headers were not found. Install the system libvulkan-dev package or set VULKAN_SDK.")
+endif()
+
+if(CMAKE_CROSSCOMPILING)
+    set(MYCSGO_CROSS_VULKAN_INCLUDE_DIR "${CMAKE_BINARY_DIR}/cross-include")
+    file(MAKE_DIRECTORY "${MYCSGO_CROSS_VULKAN_INCLUDE_DIR}")
+    file(REMOVE_RECURSE "${MYCSGO_CROSS_VULKAN_INCLUDE_DIR}/vulkan")
+    file(REMOVE_RECURSE "${MYCSGO_CROSS_VULKAN_INCLUDE_DIR}/vk_video")
+    file(COPY "${MYCSGO_VULKAN_INCLUDE_DIR}/vulkan" DESTINATION "${MYCSGO_CROSS_VULKAN_INCLUDE_DIR}")
+    if(EXISTS "${MYCSGO_VULKAN_INCLUDE_DIR}/vk_video")
+        file(COPY "${MYCSGO_VULKAN_INCLUDE_DIR}/vk_video" DESTINATION "${MYCSGO_CROSS_VULKAN_INCLUDE_DIR}")
     endif()
-    set(MYCSGO_VULKAN_INCLUDE_DIR "${MYCSGO_SYSTEM_VULKAN_INCLUDE_DIR}")
+    set(MYCSGO_VULKAN_INCLUDE_DIR "${MYCSGO_CROSS_VULKAN_INCLUDE_DIR}")
 endif()
 
 target_include_directories(mycsg_imgui PRIVATE "${MYCSGO_VULKAN_INCLUDE_DIR}")
@@ -109,8 +126,31 @@ if(WIN32)
         message(FATAL_ERROR "SDL3 MinGW package was not found under third_party/SDL3/x86_64-w64-mingw32.")
     endif()
 
-    set(MYCSGO_LLVM_MINGW_RUNTIME_DIR "${CMAKE_SOURCE_DIR}/.local-tools/toolchains/llvm-mingw-20260311-ucrt-ubuntu-22.04-x86_64/x86_64-w64-mingw32/bin")
 endif()
+
+function(mycsg_copy_windows_runtime_dll target dll_name)
+    if(NOT WIN32 OR NOT CMAKE_CXX_COMPILER)
+        return()
+    endif()
+
+    execute_process(
+        COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=${dll_name}
+        OUTPUT_VARIABLE MYCSGO_RUNTIME_DLL_PATH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+
+    if(MYCSGO_RUNTIME_DLL_PATH AND
+       NOT MYCSGO_RUNTIME_DLL_PATH STREQUAL dll_name AND
+       EXISTS "${MYCSGO_RUNTIME_DLL_PATH}")
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${MYCSGO_RUNTIME_DLL_PATH}"
+                "$<TARGET_FILE_DIR:${target}>/${dll_name}"
+            VERBATIM
+        )
+    endif()
+endfunction()
 
 function(mycsg_configure_target target entry_source)
     add_executable(${target}
@@ -152,18 +192,15 @@ function(mycsg_configure_target target entry_source)
             )
         endif()
 
-        if(EXISTS "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}")
-            foreach(MYCSGO_RUNTIME_DLL IN ITEMS libc++.dll libunwind.dll libwinpthread-1.dll)
-                if(EXISTS "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}/${MYCSGO_RUNTIME_DLL}")
-                    add_custom_command(TARGET ${target} POST_BUILD
-                        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                            "${MYCSGO_LLVM_MINGW_RUNTIME_DIR}/${MYCSGO_RUNTIME_DLL}"
-                            "$<TARGET_FILE_DIR:${target}>/${MYCSGO_RUNTIME_DLL}"
-                        VERBATIM
-                    )
-                endif()
-            endforeach()
-        endif()
+        foreach(MYCSGO_RUNTIME_DLL IN ITEMS
+            libc++.dll
+            libunwind.dll
+            libstdc++-6.dll
+            libgcc_s_seh-1.dll
+            libwinpthread-1.dll
+        )
+            mycsg_copy_windows_runtime_dll(${target} "${MYCSGO_RUNTIME_DLL}")
+        endforeach()
     else()
         target_sources(${target} PRIVATE src/platform/null/NullWindow.cpp)
         target_link_libraries(${target} PRIVATE dl)

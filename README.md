@@ -61,16 +61,41 @@ cmake --preset windows-vs2022-x64
 cmake --build --preset windows-debug
 ```
 
-## 无 root 的本地交叉编译依赖
+## 系统安装的交叉编译依赖
 
-当前仓库已经支持把交叉编译依赖放在 `.local-tools/` 下使用，不需要系统安装。
+当前仓库优先使用系统里安装的交叉编译工具，不再依赖 `.local-tools/` 里的固定路径。
 
-本地已准备：
+Ubuntu 24.04 可以安装：
 
-- `CMake 4.3.0`
-- `Ninja 1.13.2`
-- `llvm-mingw 20260311`
-- `Vulkan-Headers 1.4.341.0`
+- `cmake`
+- `ninja-build`
+- `glslang-tools`
+- `libvulkan-dev`
+- `mingw-w64`
+- `gcc-mingw-w64-x86-64`
+- `g++-mingw-w64-x86-64`
+- `binutils-mingw-w64-x86-64`
+
+可以直接执行：
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  cmake \
+  ninja-build \
+  glslang-tools \
+  libvulkan-dev \
+  mingw-w64 \
+  gcc-mingw-w64-x86-64 \
+  g++-mingw-w64-x86-64 \
+  binutils-mingw-w64-x86-64 \
+  pkg-config \
+  libfreetype-dev \
+  fonts-noto-cjk \
+  python3 \
+  rsync
+```
 
 交叉编译命令：
 
@@ -79,12 +104,12 @@ cmake --build --preset windows-debug
 ./tools/build-windows-cross.sh
 ```
 
-构建完成后，把 `build/windows-x64-llvm-mingw/` 整个目录一起拷到 Windows。
+构建完成后，把 `build/windows-x64-mingw/` 整个目录一起拷到 Windows。
 
-目录里除了 `my-cs-go.exe`，还会自动带上运行时 DLL：
+目录里除了 `my-cs-go.exe`，还会自动带上运行时 DLL。常见会包含：
 
-- `libc++.dll`
-- `libunwind.dll`
+- `libstdc++-6.dll` 或 `libc++.dll`
+- `libgcc_s_seh-1.dll` 或 `libunwind.dll`
 - `libwinpthread-1.dll`
 - `SDL3.dll`
 
@@ -94,7 +119,7 @@ cmake --build --preset windows-debug
 ./tools/copy-windows-package.sh
 ```
 
-默认会把运行时文件和 `assets/` 同步到 `/mnt/e/111222/windows-x64-llvm-mingw/`，也可以手动指定目标目录。
+默认会把运行时文件和 `assets/` 同步到 `dist/windows-x64-mingw/`，也可以手动指定目标目录。
 
 ## 中文文字资源生成
 
@@ -113,7 +138,8 @@ cmake --build --preset windows-debug
 Linux 侧需要准备：
 
 - `freetype2` 开发包
-- `Noto Sans CJK` 字体，脚本默认查找系统里的 `NotoSansCJK-Regular.ttc` 或 `NotoSansCJK-Bold.ttc`
+- 如果仓库里没有 `assets/fonts/NotoSansSC-Variable.ttf`，再准备 `Noto Sans CJK` 系统字体
+- 也可以手动设置 `FONT_PATH=/path/to/font.ttf` 指定字形生成源字体
 
 这个方案的好处是：
 

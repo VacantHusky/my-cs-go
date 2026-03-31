@@ -2216,7 +2216,7 @@ void Application::updateMapEditorView(const platform::InputSnapshot& input, cons
         if (mapEditorMouseLookActive_) {
             mapEditorPerspectiveCameraYawRadians_ += static_cast<float>(input.mouseDeltaX) * mouseYawScale;
             mapEditorPerspectiveCameraPitchRadians_ = std::clamp(
-                mapEditorPerspectiveCameraPitchRadians_ + static_cast<float>(input.mouseDeltaY) * mousePitchScale,
+                mapEditorPerspectiveCameraPitchRadians_ - static_cast<float>(input.mouseDeltaY) * mousePitchScale,
                 -maxPitchRadians,
                 maxPitchRadians);
         }
